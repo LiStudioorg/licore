@@ -2,6 +2,12 @@
 
 > 用 Go 编写的轻量级容器引擎：无守护进程，2.3 MiB/容器，覆盖 Linux / Android / macOS；自研 `.licore` 镜像格式，不兼容 OCI。
 
+![LiCore 演示：导入镜像 → 后台运行 → 端口访问 → exec → 停止删除](docs/demo.gif)
+
+> 演示录屏（非剪辑）：导入 `.licore` 镜像、`run -d` 后台启动、宿主经端口映射直接访问、
+> `exec` 进入容器命名空间、停止并删除。录制脚本 [scripts/demo.tape](scripts/demo.tape)，
+> 环境准备与清理 [scripts/prepare-demo.sh](scripts/prepare-demo.sh)。
+
 ![LiCore 架构：无守护进程，对照 Docker](docs/architecture.svg)
 
 > 左侧是 LiCore：单个二进制按需执行，**没有常驻守护进程**，每个容器由一个轻量 shim 持有。
