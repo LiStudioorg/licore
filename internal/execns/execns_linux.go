@@ -169,22 +169,23 @@ func buildNsenterArgv(prog *nsenterProg, targetPID int, workdir string, cmd []st
 	argv = append(argv, prog.args...)
 	argv = append(argv, "-t", strconv.Itoa(targetPID))
 	argv = append(argv, nsFlags...)
-	// root 必须显式置为 "/"（-r 的参数在两种实现上都是可选值，须紧贴写成 -r/）。
+	// 刻意**不加 -r/**。
 	//
-	// 原因：进入 mount namespace 之前，nsenter 进程的 cwd 仍是**宿主**的某个目录；
-	// setns(CLONE_NEWNS) 之后该 cwd 在容器视图里通常不存在，于是 exec 出去的进程
-	// 继承一个失效的 cwd——实测 `sh -c pwd` 报 getcwd() failed。
-	argv = append(argv, "-r/")
-	// 工作目录必须**总是**下发（缺省为容器的 "/"），且写成 **紧贴** 形式 "-w<dir>"：
+	// setns(CLONE_NEWNS) 之后进程的根目录**已经是容器 root**，nsenter 再补一次
+	// chroot 属于多余操作，而且会把 cwd 搞坏：真机实测加 -r/ 后 `pwd` 报
+	// `getcwd: No such file or directory`，不加则正常输出 `/`。
 	//
-	//   - 不下发 -w 时 nsenter 保留继承来的宿主 cwd，而 -r/ 只改 root 不改 cwd，
-	//     容器内进程依然带着一个失效的 cwd（实测报 getcwd() failed）；
-	//   - -w 的参数在 util-linux 与 busybox 上都是「可选」的，写成 "-w" "/app"
-	//     会把 /app 当成要执行的命令（实测报 `failed to execute /tmp: Permission denied`）。
-	if workdir == "" {
-		workdir = "/"
+	// 历史教训（本仓库曾经写反过）：早先的注释声称"不加 -r/ 时 cwd 会失效"，
+	// 于是加上 -r/ 去"修"它——实测证明恰好相反，是 -r/ 导致了 cwd 失效；
+	// 当时还据此加了 -w/ 去补偿，等于用第二个参数掩盖第一个参数造成的问题。
+	// 现在两个默认都不下发：进容器后 cwd 天然就是 `/`，无需任何补偿。
+	//
+	// 仅当用户显式要求了工作目录（licore exec -w /app）才下发 -w。
+	// -w 的参数在 util-linux 与 busybox 上都是「可选」的，因此必须写成
+	// **紧贴**形式 "-w<dir>"；写成 "-w" "/app" 会把 /app 当成要执行的命令。
+	if workdir != "" && workdir != "/" {
+		argv = append(argv, "-w"+workdir)
 	}
-	argv = append(argv, "-w"+workdir)
 	// `--` 终止选项解析：目标命令自身可能以 '-' 开头，不加会被当成 nsenter 的选项。
 	argv = append(argv, "--")
 	argv = append(argv, cmd...)
