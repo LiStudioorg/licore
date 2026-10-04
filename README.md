@@ -157,6 +157,7 @@ licore search myapp                     # 在 Hub 上搜索镜像
 ```bash
 licore build -t demo:v1 .                 # 用 ./Boxfile（或 ./boxfile）构建并导入 demo:v1
 licore build -f path/to/Boxfile -t demo:v1 --context ./src
+licore build -t alpine:3.20.3-arm64 --arch arm64 ./rootfs-arm64   # 交叉构建 arm64 镜像
 licore images                              # 看到 demo:v1
 ```
 
@@ -164,8 +165,73 @@ licore images                              # 看到 demo:v1
   上下文决定 `COPY` 的源目录，静默落到 cwd 会把错误的（甚至敏感的）文件打进
   镜像；两者同时给出且不一致会直接报错。
 
+- `--arch` / `--os` 覆盖产物的平台字段（`--arch` 可选
+  `amd64` / `arm64` / `arm` / `386` / `riscv64` / `loong64`），留空跟随宿主。
+  交叉构建的产物会跳过平台匹配检查并正常导入本地，无需手工改 `index.json`。
+
 - `FROM scratch` 为空基础镜像；`FROM name:version` 需先在本地存在（或先 `licore pull`）。
 - 未实现的指令（`RUN`、远程 `ADD`）与资源能力会显式报错，不假装成功。
+
+### COPY 的源路径要逐层列出（不支持 `COPY . /`）
+
+`COPY . /` 会被明确拒绝：
+
+```text
+licore: 第 2 行 COPY: 路径 "." 含 "." 段: licore/build: 构建上下文非法
+```
+
+这是**有意的安全策略**，不是缺陷：`COPY . /` 会把构建上下文里的一切
+（`.git/`、密钥、`node_modules/`、编辑器临时文件）无差别打进镜像层，是容器
+镜像最常见的凭据泄漏来源。要求逐条列举，等于强制作者显式声明哪些内容该进镜像。
+
+**要复制整个上下文，就按顶层目录逐个写**。一个手工构建 alpine 基础镜像的
+完整 Boxfile（17 行）：
+
+```dockerfile
+FROM scratch
+
+# 逐个顶层目录复制（COPY . / 不被支持，理由见上）
+COPY bin /bin
+COPY etc /etc
+COPY lib /lib
+COPY sbin /sbin
+COPY usr /usr
+COPY var /var
+COPY opt /opt
+COPY media /media
+COPY mnt /mnt
+COPY root /root
+COPY run /run
+COPY srv /srv
+COPY tmp /tmp
+
+CMD ["/bin/sh"]
+```
+
+然后交叉构建并导出：
+
+```bash
+licore build -t alpine:3.20.3-arm64 --arch arm64 ./rootfs-arm64
+licore save alpine:3.20.3-arm64 alpine-3.20.3-arm64.licore   # 位置参数或 -o 都可以
+```
+
+详见 [docs/image-spec.md](docs/image-spec.md) 的「Boxfile 的 COPY 与构建上下文」一节。
+
+### 导出与删除本地镜像
+
+```bash
+licore save alpine:3.20.3 out.licore      # 位置参数写法
+licore save alpine:3.20.3 -o out.licore   # -o/--output 写法（两者一致时也可同时给）
+licore export alpine:3.20.3 out.licore    # export 是 save 的同义命令
+
+licore rmi alpine:3.20.3-arm64            # 删除本地镜像
+licore rmi -f alpine:3.20.3-arm64         # 即使仍被容器引用也强制删除
+```
+
+- `save` 的输出路径两种写法等价；同时给出且不一致会报错，都不给则提示用法。
+- `rmi` 只写仓库名而该仓库有多个 tag 时会报错要求写全版本，不会任选一个删。
+  镜像不存在、或仍被容器引用（未加 `-f`）都返回明确错误。
+- 删除只针对该引用自己的目录；层缓存跨镜像共享，不随镜像删除回收。
 
 ## 容器网络
 

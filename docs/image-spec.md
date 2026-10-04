@@ -164,6 +164,64 @@ UTF-8 JSON，无 BOM，允许任意空白，解析器必须容忍键序。Schema
 - `licore hub pack`（未实现）：目录 → 分层 → 生成 `index.json` → 输出 `.licore`
 - 分发（阶段 2+）：`hub.licore.dev` 自研极简 registry，tag → `.licore` 文件 + `index.json` 摘要接口，不提供任何 Docker Distribution API 兼容层。
 
+### 6.1 Boxfile 的 COPY 与构建上下文
+
+`licore build` 把 Boxfile 的 `COPY` 源路径解析为**构建上下文内的相对路径**，
+并由 `internal/build` 的 `checkContextRel` 做规范化校验。它**不接受** `.` 与 `..`
+路径段，因此：
+
+```dockerfile
+# ❌ 被拒绝：路径 "." 含 "." 段
+FROM scratch
+COPY . /
+
+# ✅ 正确：把上下文的每个顶层目录逐个列出
+FROM scratch
+COPY etc /etc
+COPY bin /bin
+COPY lib /lib
+```
+
+这**不是**待修的缺陷，而是一条有意的安全策略：`COPY . /` 会把构建上下文里
+任何东西（`.git/`、密钥、`node_modules/`、构建脚本、编辑器临时文件）无差别
+塞进镜像层，是容器镜像里最常见的凭据泄漏来源。要求逐条列举，等于强制作者
+显式声明"我确实要这些内容进镜像"。
+
+**要为整个 rootfs 建镜像怎么办**：按目录逐个 `COPY`。下面是一个手工构建
+alpine 基础镜像的完整例子（17 行），它把一个解压好的 `rootfs/` 目录装进
+`scratch`：
+
+```dockerfile
+FROM scratch
+
+# 逐个顶层目录复制（COPY . / 不被支持，理由见上）
+COPY bin /bin
+COPY etc /etc
+COPY lib /lib
+COPY sbin /sbin
+COPY usr /usr
+COPY var /var
+COPY opt /opt
+COPY media /media
+COPY mnt /mnt
+COPY root /root
+COPY run /run
+COPY srv /srv
+COPY tmp /tmp
+
+CMD ["/bin/sh"]
+```
+
+要点：
+
+- 每个 `COPY` 的源路径是**构建上下文内**的相对路径；上下文由 `licore build`
+  的末尾位置参数或 `--context` 指定，想用当前目录就传 `.`。
+- 目标路径可以是目录（`COPY etc /etc`，内容并入 `/etc`），也可以是文件。
+- 只存在于 rootfs 里的空目录、设备节点等特殊条目按 `internal/storage` 的
+  既有规则处理（设备节点与 setuid 位在解包时统一剥离）。
+- 交叉构建（如从 amd64 机器产出 arm64 镜像）加 `--arch arm64`，详见
+  `licore build --help`。
+
 ## 7. 版本演进策略
 
 - 不兼容变更：只允许通过 `specVersion` 升级（如 `licore/image-spec/v2`），旧引擎必须明确拒绝。
