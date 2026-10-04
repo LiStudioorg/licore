@@ -33,6 +33,7 @@ func newConvertCommand(out io.Writer) *cobra.Command {
 		tag       string
 		fromFile  string
 		outputDir string
+		jobs      int
 	)
 	cmd := &cobra.Command{
 		Use:   "convert [docker-image]",
@@ -64,6 +65,7 @@ func newConvertCommand(out io.Writer) *cobra.Command {
 					fromFile:  fromFile,
 					outputDir: outputDir,
 					arch:      arch,
+					jobs:      jobs,
 					noCleanup: noCleanup,
 					keepImage: keepImage,
 					dataDir:   dataDir,
@@ -144,6 +146,7 @@ func newConvertCommand(out io.Writer) *cobra.Command {
 	cmd.Flags().StringVar(&tag, "tag", "", "覆盖产物镜像引用 NAME:VERSION（默认由 docker 镜像名派生）")
 	cmd.Flags().StringVar(&fromFile, "from-file", "", "批量转换：镜像清单文件（每行一个，支持 # 注释）")
 	cmd.Flags().StringVar(&outputDir, "output-dir", "", "批量转换：输出目录（配合 --from-file）")
+	cmd.Flags().IntVar(&jobs, "jobs", 1, "批量转换：并发数（默认 1；docker 自身会串行化部分操作，调大不总是更快）")
 	return cmd
 }
 
@@ -163,12 +166,15 @@ func humanSize(n int64) string {
 
 // batchOutputPath 计算批量模式下单个镜像的输出文件名。
 //
-//	alpine:3.20          → dist/alpine-3.20.licore
-//	library/nginx:1.27   → dist/nginx-1.27.licore
-//	registry:5000/x:1    → dist/x-1.licore
+//	alpine:3.20          arch=amd64 → dist/alpine-amd64.licore
+//	library/nginx:1.27   arch=arm64 → dist/nginx-arm64.licore
+//	registry:5000/x:1    arch=amd64 → dist/x-amd64.licore
 //
 // 只取仓库名的最后一段并替换掉不适合做文件名的字符，避免 `library/` 之类
 // 在 dist/ 下建出多余的目录层级。
+//
+// 注意：文件名按约定**不含 tag**（同一仓库的不同版本会映射到同一个名字）。
+// 因此批量模式必须先做重名检查——见 checkOutputCollisions。
 func batchOutputPath(dir, image, arch string) string {
 	name := image
 	if i := strings.IndexByte(name, '@'); i >= 0 {
@@ -181,12 +187,28 @@ func batchOutputPath(dir, image, arch string) string {
 	if i := strings.LastIndexByte(name, '/'); i >= 0 {
 		name = name[i+1:]
 	}
-	tag := "latest"
-	if i := strings.LastIndexByte(image, ':'); i >= 0 && !strings.Contains(image[i:], "/") {
-		tag = image[i+1:]
-	}
-	base := sanitizeFileBase(name + "-" + tag)
+	base := sanitizeFileBase(name + "-" + arch)
 	return filepath.Join(dir, base+".licore")
+}
+
+// checkOutputCollisions 在开始转换前检查产物重名。
+//
+// 为什么必须前置检查：产物文件名是 `<repo>-<arch>`，不含 tag。若清单里同时
+// 有 nginx:1.26 与 nginx:1.27，两者会映射到同一个 dist/nginx-amd64.licore，
+// 后转换的会**静默覆盖**前一个——用户拿到一个文件却以为是两个，属于静默数据
+// 丢失。宁可一开始就报错让人改清单，也不要转完一半才发现只有一个产物。
+func checkOutputCollisions(items []batchItem, dir, arch string) error {
+	seen := make(map[string]string, len(items)) // 输出路径 → 首个镜像
+	for _, it := range items {
+		p := batchOutputPath(dir, it.image, arch)
+		if prev, ok := seen[p]; ok {
+			return fmt.Errorf("convert: 清单里 %q 与 %q 会产出同一个文件 %s；"+
+				"批量产物名不含 tag，请拆成两次运行，或先用 --output-dir 分开",
+				prev, it.image, p)
+		}
+		seen[p] = it.image
+	}
+	return nil
 }
 
 // sanitizeFileBase 把字符串里不适合出现在文件名中的字符替换为 '-'。
