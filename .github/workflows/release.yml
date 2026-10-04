@@ -240,7 +240,7 @@ jobs:
             echo
             echo "**校验下载**：每个归档都列入 \`SHA256SUMS\`，可用 \`sha256sum -c SHA256SUMS\` 校验。"
             echo
-            echo "**说明**：全部包都是纯 Go 静态二进制（无 glibc / 动态库依赖），\`licore exec\` 依赖系统自带或可安装的 \`nsenter\`（util-linux、Toybox、busybox 均提供）。"
+            echo "**说明**：全部包都是纯 Go 产物（\`CGO_ENABLED=0\`，无 cgo / glibc 依赖）——linux/* 为静态链接，android/darwin 因平台运行时本就是动态链接（与 cgo 无关）。\`licore exec\` 依赖系统自带或可安装的 \`nsenter\`（util-linux、Toybox、busybox 均提供）。"
           } > /tmp/release-notes.md
           echo "Release notes 预览："
           cat /tmp/release-notes.md
