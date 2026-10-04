@@ -73,7 +73,12 @@ func Exec(o *ExecOptions) (int, error) {
 		inFd, outFd, errFd = int(s.Fd()), int(s.Fd()), int(s.Fd())
 	}
 
-	pid, err := execns.Enter(o.TargetPID, o.Workdir, o.User, o.Env, inFd, outFd, errFd, o.Cmd)
+	// 经容器内的 helper 收口后再执行用户命令：helper 是 licore 自身，
+	// 由容器启动时只读 bind 进 HelperPathInContainer（见 InstallExecHelper）。
+	// 它会在 execve 用户命令之前做 no_new_privs / cap-drop / seccomp——
+	// 否则 exec 出来的进程是宿主 root 满能力，容器 init 的隔离对它无效。
+	pid, err := execns.Enter(o.TargetPID, o.Workdir, o.User, o.Env, inFd, outFd, errFd,
+		o.Cmd, HelperPathInContainer)
 	if err != nil {
 		return -1, err
 	}

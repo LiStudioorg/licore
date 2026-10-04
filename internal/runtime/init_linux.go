@@ -559,6 +559,13 @@ func RunInit() error {
 	if err := mountRootfsVolumes(rootfs); err != nil {
 		return err
 	}
+	// 3.6 exec helper：把 licore 自身只读 bind 进容器固定路径。
+	//     与卷同一时机（pivot_root 之前），原因相同。
+	//     `licore exec` 在容器内执行它来做收口——否则 exec 进来的进程是
+	//     宿主 root 满能力，容器 init 的隔离对它完全无效。
+	if err := InstallExecHelper(rootfs); err != nil {
+		return err
+	}
 	// 4. 先挂 procfs（早于 pivot_root）。部分环境（如嵌套容器）在 pivot 并卸载旧根后
 	//    拒绝再建 proc 超块；pivot 前挂载得到的是绑定本 PID namespace 的全新 procfs，
 	//    随 rootfs 一起进入新根，语义完全等价。

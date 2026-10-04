@@ -77,7 +77,7 @@ func TestFindNsenterNone(t *testing.T) {
 // 安装指引，而不是一句无来由的失败。
 func TestEnterWithoutNsenterReportsInstallHint(t *testing.T) {
 	fakeLookPath(t, map[string]string{})
-	_, err := Enter(1234, "", "", nil, 0, 1, 2, []string{"/bin/sh"})
+	_, err := Enter(1234, "", "", nil, 0, 1, 2, []string{"/bin/sh"}, "")
 	if err == nil {
 		t.Fatal("缺 nsenter 应报错")
 	}
@@ -368,3 +368,46 @@ func findNsenterReal() *nsenterProg {
 
 // selfPID 返回当前进程 pid，用作 nsenter 的 target（进入自己所在的命名空间）。
 func selfPID() int { return os.Getpid() }
+
+// TestWrapWithHelper 验证目标命令被包成「helper 收口 → 用户命令」。
+//
+// 这是 exec 隔离成立的关键：nsenter 执行的是 helper，helper 做完收口
+// 再 execve 用户命令。若包装丢了，"exec 只允许收紧"就无从谈起。
+func TestWrapWithHelper(t *testing.T) {
+	// helperPath 为空：保持原行为（不包）。
+	got := wrapWithHelper("", []string{"/bin/sh", "-c", "hi"})
+	if strings.Join(got, " ") != "/bin/sh -c hi" {
+		t.Errorf("空 helperPath 应原样返回，得到 %v", got)
+	}
+
+	// 非空：包成 <helper> exec-setup -- <cmd...>
+	got = wrapWithHelper("/.licore/exec-helper", []string{"/bin/sh", "-c", "hi"})
+	want := "/.licore/exec-helper exec-setup -- /bin/sh -c hi"
+	if strings.Join(got, " ") != want {
+		t.Errorf("argv =\n  %v\nwant\n  %v", got, want)
+	}
+}
+
+// TestBuildNsenterArgvWithHelper 验证经 nsenter 之后的完整命令行。
+//
+// 断言完整形态，确保 -- 分隔符与 helper 位置正确：
+// 少了 -- 时，以 '-' 开头的用户命令会被 nsenter 当成自己的选项。
+func TestBuildNsenterArgvWithHelper(t *testing.T) {
+	prog := &nsenterProg{path: "/usr/bin/nsenter"}
+	cmd := wrapWithHelper("/.licore/exec-helper", []string{"/bin/sh", "-c", "hostname"})
+	got, err := buildNsenterArgv(prog, 4242, "", cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"/usr/bin/nsenter",
+		"-t", "4242",
+		"-m", "-u", "-i", "-n", "-p",
+		"-r/", "-w/",
+		"--",
+		"/.licore/exec-helper", "exec-setup", "--", "/bin/sh", "-c", "hostname",
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("argv =\n  %v\nwant\n  %v", got, want)
+	}
+}

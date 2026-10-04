@@ -55,6 +55,7 @@ func NewRootCommand(out, errOut io.Writer) *cobra.Command {
 		newBootTestCommand(out),
 		newShutdownCommand(out),
 		newInitCommand(out),
+		newExecSetupCommand(out),
 		newSpikeCommand(out),
 		newShimCommand(out),
 		// 镜像产物操作。

@@ -27,12 +27,23 @@ func newExecCommand(out io.Writer) *cobra.Command {
 		workdir     string
 		env         []string
 		dataDir     string
+		capDrop     []string
+		capAdd      []string
 	}
 	cmd := &cobra.Command{
 		Use:   "exec [flags] <容器ID|名字> <command...>",
 		Short: "在运行中的容器里执行命令",
 		Args:  cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// 安全边界：exec 只能进一步收紧能力，不允许放宽。
+			// 否则任何能跑 licore exec 的人都能加回 CAP_SYS_ADMIN，
+			// 容器 init 的收口就完全白做了。
+			if err := rejectCapAddForExec(opts.capAdd); err != nil {
+				return err
+			}
+			if err := validateCapSpecs(opts.capDrop, nil); err != nil {
+				return err
+			}
 			st, err := store.Open(opts.dataDir)
 			if err != nil {
 				return err
@@ -55,10 +66,15 @@ func newExecCommand(out io.Writer) *cobra.Command {
 					return fmt.Errorf("exec: 非法 --user %q", opts.user)
 				}
 			}
+			// 收口规格经环境变量下发给容器内的 helper：
+			// 默认继承**容器创建时**的 --cap-drop，再叠加本次 exec 的 --cap-drop。
+			// 这些 LICORE_* 变量会被 helper 在 execve 用户命令前剥掉，
+			// 因此不会泄漏进用户命令的环境。
+			env := append(runtime.ExecSetupEnv(cfg.CapDrop, opts.capDrop), opts.env...)
 			code, err := runtime.Exec(&runtime.ExecOptions{
 				TargetPID: state.InitPID,
 				Cmd:       args[1:],
-				Env:       opts.env,
+				Env:       env,
 				Workdir:   opts.workdir,
 				User:      opts.user,
 				TTY:       opts.tty,
@@ -81,5 +97,9 @@ func newExecCommand(out io.Writer) *cobra.Command {
 	cmd.Flags().StringVarP(&opts.workdir, "workdir", "w", "", "工作目录（容器内路径）")
 	cmd.Flags().StringArrayVarP(&opts.env, "env", "e", nil, "环境变量 KEY=VALUE，可重复")
 	cmd.Flags().StringVar(&opts.dataDir, "data-dir", "", "数据目录（默认 $LICORE_HOME 或 ~/.licore）")
+	cmd.Flags().StringSliceVar(&opts.capDrop, "cap-drop", nil,
+		"在容器已有能力基础上进一步收紧（可重复）；exec **只允许收紧**")
+	cmd.Flags().StringSliceVar(&opts.capAdd, "cap-add", nil,
+		"（已禁用）exec 不允许放宽能力；该参数会被明确拒绝")
 	return cmd
 }

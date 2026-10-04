@@ -102,12 +102,20 @@ var nsFlags = []string{"-m", "-u", "-i", "-n", "-p"}
 // 子进程的 stdio 用 in/out/err fd。工作目录与 uid/gid 都由 nsenter 自己设置
 // （`-w<dir>` 与 `-S/-G`）：Go 侧先 chdir 是无效的——chdir 发生在宿主视图下，
 // 进 mount namespace 后该 cwd 不再存在；先 setuid 则更不行，降权后无法 setns。
-func Enter(targetPID int, workdir, user string, env []string, inFd, outFd, errFd int, cmd []string) (int, error) {
+//
+// helperPath 非空时，实际执行的是「helperPath exec-setup -- <cmd>」而不是 cmd
+// 本身：helper 在容器内做权限收口（no_new_privs / cap-drop / seccomp）后再
+// execve cmd。传空串保持原行为（直接执行 cmd）。
+//
+// 为什么必须经 helper：nsenter 进程来自宿主 root，继承**宿主满能力**；
+// 容器 init 里的收口对它无效。不做这一步的话，任何能跑 licore exec 的人
+// 都能拿到宿主 root 的全部能力。
+func Enter(targetPID int, workdir, user string, env []string, inFd, outFd, errFd int, cmd []string, helperPath string) (int, error) {
 	prog := findNsenter()
 	if prog == nil {
 		return -1, nsenterMissingError()
 	}
-	argv, err := buildNsenterArgv(prog, targetPID, workdir, cmd)
+	argv, err := buildNsenterArgv(prog, targetPID, workdir, wrapWithHelper(helperPath, cmd))
 	if err != nil {
 		return -1, err
 	}
@@ -181,6 +189,29 @@ func buildNsenterArgv(prog *nsenterProg, targetPID int, workdir string, cmd []st
 	argv = append(argv, "--")
 	argv = append(argv, cmd...)
 	return argv, nil
+}
+
+// wrapWithHelper 把目标命令包成「经 helper 收口后再执行」的形式。
+//
+// helperPath 为空时原样返回 cmd（保持 Enter 的旧行为，便于测试与降级）。
+// 非空时返回：
+//
+//	<helperPath> exec-setup -- <cmd...>
+//
+// 为什么必须经过 helper：nsenter 进程来自宿主 root，继承**宿主满能力**；
+// 容器 init 里的 no_new_privs / cap-drop / seccomp 对它完全无效。
+// 不做这一步，任何能跑 licore exec 的人都能拿到宿主 root 的全部能力。
+//
+// helperPath 是容器内路径（见 runtime.HelperPathInContainer）：nsenter 的
+// -r/ 已把 root 切到容器，exec 的命令按容器视图解析。
+func wrapWithHelper(helperPath string, cmd []string) []string {
+	if helperPath == "" {
+		return cmd
+	}
+	out := make([]string, 0, len(cmd)+3)
+	out = append(out, helperPath, "exec-setup", "--")
+	out = append(out, cmd...)
+	return out
 }
 
 // Wait 等待 Enter 返回的子进程并返回退出码（信号死亡 128+signum）。
