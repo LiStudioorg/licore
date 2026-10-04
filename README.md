@@ -1,11 +1,12 @@
 # LiCore
 
-> ⚠️ **安全警告（重要）**：**v0.8.0 之前的版本，容器没有 capability 隔离**——
-> 在 root 下运行时（Linux 服务器默认形态），容器内进程即宿主 root 且持有**全部**
-> capability，既没有 cap-drop，也没有 seccomp / AppArmor。这意味着容器内可以
-> `echo b > /proc/sysrq-trigger` 直接重启宿主、可加载 eBPF、可改写宿主
-> `/proc/sys`。**在 v0.8.0 发布前，请不要用 LiCore 运行任何不可信镜像。**
-> 修复进展见下方《安全模型》一节。
+> ⚠️ **安全提示**：**v0.8.0 之前的版本，容器没有 capability 隔离**——在 root 下
+> 运行时容器内进程即宿主 root 且持有**全部** capability，既没有 cap-drop 也没有
+> seccomp：容器内 `echo b > /proc/sysrq-trigger` 可以直接重启宿主、可加载 eBPF、
+> 可改写宿主 `/proc/sys`。**如果你在用 v0.7.x 或更早版本，请不要运行不可信镜像。**
+> v0.8.0 起已默认启用 no_new_privs + capability 裁剪 + seccomp 黑名单，但这三层
+> **尚未在真机验证**，详见 [docs/unverified.md](docs/unverified.md) 与下方
+> [容器权限隔离](#容器权限隔离) 一节。
 
 > 用 Go 编写的轻量级容器引擎：无守护进程，2.3 MiB/容器，覆盖 Linux / Android / macOS；自研 `.licore` 镜像格式，不兼容 OCI。
 
@@ -244,6 +245,26 @@ licore rmi -f alpine:3.20.3-arm64         # 即使仍被容器引用也强制删
   镜像不存在、或仍被容器引用（未加 `-f`）都返回明确错误。
 - 删除只针对该引用自己的目录；层缓存跨镜像共享，不随镜像删除回收。
 
+## 从 Docker 镜像转换（convert）
+
+把 Docker Hub 上的现成镜像转成 `.licore`，让它们能在 LiCore 里直接跑：
+
+```bash
+licore convert alpine:3.20 -o /tmp/alpine.licore    # 单个 → 文件
+licore convert nginx:1.27-alpine --import           # 单个 → 直接导入本地
+licore convert --from-file images.txt --output-dir ./dist/   # 批量（支持 --jobs）
+```
+
+转换走「`docker export` 导出 rootfs + `docker inspect` 重建运行配置」路线，
+产物是完整的单层 rootfs，**与 Docker 的存储驱动层链无关**；转换是单向的，
+无法把 `.licore` 转回 Docker 镜像。
+
+需要本机有可用的 `docker`；不影响其他正在运行的容器。
+
+**使用前请读** [docs/convert.md](docs/convert.md)——其中记录了 `HEALTHCHECK`
+会被**静默丢弃**、`${...}` 会导致失败或跳过、磁盘预检在首次拉取时只做基线
+检查等限制。
+
 ## 容器网络
 
 ```bash
@@ -278,6 +299,57 @@ licore resource update 容器ID --memory 512   # 动态调整运行中容器限�
 ```
 
 注：资源限制在无权限或非 Linux 平台下列表应用失败时降级为告警（`slog.Warn`），不阻断容器运行。
+
+## 容器权限隔离
+
+> **当前状态**：v0.8.0 起默认启用下面三层，但**尚未在真机验证过**——
+> 详见 [docs/unverified.md](docs/unverified.md)。在你自己确认之前，仍不建议
+> 用 LiCore 运行不可信镜像。
+
+v0.8.0 之前，容器在 root 下运行时就是**宿主 root 且持有全部 capability**，
+既没有 cap-drop 也没有 seccomp：容器内 `echo b > /proc/sysrq-trigger`
+可以直接重启宿主。v0.8.0 补上了三层防护：
+
+| 层 | 默认行为 | 作用 |
+| --- | --- | --- |
+| `PR_SET_NO_NEW_PRIVS` | 始终开启 | 阻止经 execve 提权（setuid / file capabilities） |
+| capability 裁剪 | 丢光后只放回 Docker 默认集（14 项） | 拿掉 `CAP_SYS_ADMIN` / `CAP_NET_ADMIN` / `CAP_SYS_MODULE` 等 |
+| seccomp 黑名单 | 31 条危险系统调用返回 `EPERM` | 纵深防御第二层：`reboot` / `init_module` / `ptrace` / `unshare` / `mount` / `clone(CLONE_NEWUSER)` 等 |
+
+```bash
+licore run myapp:v1                              # 默认集（与 Docker 默认一致）
+licore run --cap-add SYS_PTRACE myapp:v1         # 追加能力
+licore run --cap-drop NET_RAW myapp:v1           # 从默认集移除
+licore run --cap-drop ALL --cap-add NET_BIND_SERVICE myapp:v1   # 清空后只留指定项
+```
+
+能力名大小写不敏感，`CAP_` 前缀可带可不带（`net_admin` / `CAP_NET_ADMIN` 等价）；
+`--cap-add ALL` 补齐全部已知能力。默认能力集与 Docker 一致，对应位图
+`CapEff=0x00000000a80425fb`。
+
+**验证当前容器的权限状态**（读**容器 PID 1**，不要用 `exec`）：
+
+```bash
+CID=$(licore ps -q | head -1)
+INITPID=$(sed -n 's/.*"initPid"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' \
+  ~/.licore/containers/$CID/runtime.json)
+grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/$INITPID/status
+# 期望：CapEff 不含 bit 21（CAP_SYS_ADMIN）、NoNewPrivs: 1、Seccomp: 2
+```
+
+完整验证脚本：[scripts/verify-capabilities.sh](scripts/verify-capabilities.sh)
+（以 root 运行；有风险的 sysrq 测试默认跳过，需 `--unsafe` 显式开启）。
+
+**已知缺口**——这些**没有**防护，不要假定容器已完全隔离：
+
+- **`licore exec` 不受裁剪约束**：它走宿主侧 `nsenter`，继承宿主 root 的完整能力。
+  因此不要用 `licore exec ... grep CapEff` 判断隔离是否生效（读到的是宿主位图），
+  也不要把 `exec` 当作受限入口。
+- **没有 AppArmor / SELinux 强制策略**；SELinux 仅继承引擎的 exec 上下文。
+- **seccomp 是黑名单**（不是 Docker 那样的白名单），因此**不拦未知系统调用**。
+  另有 `bpf`、`userfaultfd`、`kcmp`、`process_vm_readv/writev`、
+  `open_by_handle_at`、`finit_module` 等未列入——标准库未导出这些常量。
+- 容器**共享宿主内核**，与所有容器方案一样存在内核漏洞逃逸风险。
 
 ## 进入运行中容器（exec）
 
@@ -561,6 +633,8 @@ LiCore 只认 `.licore`。这不是"还没做"，是设计选择（见 [docs/ima
 | **`licore boot enable`** | ⚠️ 部分 | systemd unit **生成与内容**已验证；未在真机实际 `enable` 并重启验证 |
 | **Windows** | ⚙️ 通过 WSL2 | 在 WSL2（或虚拟机）里安装 Linux 版 LiCore，与原生 Linux 体验一致；LiCore 本身不提供 Windows 原生后端。 |
 | **ARM / 386 / riscv64 真机运行** | ⚠️ 仅交叉编译 | 这些平台**能编译通过**，但未在对应硬件上运行验证 |
+| **容器权限隔离（v0.8.0 三层防护）** | ❌ 未在真机验证 | no_new_privs / capability 裁剪 / seccomp 的代码与单测已完成，seccomp 的安装与拦截在沙箱内已实测，但**没有在真实 root 服务器上确认过容器内的实际位图**。详见 [docs/unverified.md](docs/unverified.md) |
+| **`licore convert` 真机** | ⚠️ 仅 fake docker | 单镜像与批量转换的完整流程用注入的 fake docker 跑通（含失败路径），但**未在装了真实 docker 的机器上跑过** |
 
 > 我们宁可在 README 里写"没验证过"，也不希望你踩到才发现。发现文档与实现不符请
 > 直接开 issue——那属于 bug。
