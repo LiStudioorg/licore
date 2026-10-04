@@ -73,6 +73,7 @@ func NewRootCommand(out, errOut io.Writer) *cobra.Command {
 		newComposeCommand(out),
 		newDevCommand(out),
 		newBuildCommand(out),
+		newConvertCommand(out),
 		newDoctorCommand(out),
 		newLintCommand(out),
 		newScaffoldCommand(out),

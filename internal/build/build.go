@@ -476,6 +476,9 @@ func configOf(opts *Options, base *baseImage) *image.Config {
 
 // applyInstructions 按顺序施加全部指令：COPY 落 rootfs，其余落 config。
 func applyInstructions(ctx context.Context, opts *Options, rootfs string, cfg *image.Config, res *Result) error {
+	// copiedInodes 跨本次构建的所有 COPY 指令共享：同一份上下文文件被多条
+	// COPY 引用时也能识别为同一 inode，避免重复落内容（见 copyInto）。
+	copiedInodes := make(map[inodeKey]string)
 	for _, in := range opts.Boxfile.Instructions {
 		select {
 		case <-ctx.Done():
@@ -484,7 +487,7 @@ func applyInstructions(ctx context.Context, opts *Options, rootfs string, cfg *i
 		}
 		switch in.Op {
 		case OpCopy:
-			if err := applyCopy(opts.ContextDir, rootfs, in, res); err != nil {
+			if err := applyCopy(opts.ContextDir, rootfs, in, res, copiedInodes); err != nil {
 				return err
 			}
 		case OpEnv:
@@ -567,7 +570,7 @@ func appendUnique(list []string, v string) []string {
 }
 
 // applyCopy 执行一条 COPY：源来自构建上下文，目标落在 rootfs 内。
-func applyCopy(contextDir, rootfs string, in Instruction, res *Result) error {
+func applyCopy(contextDir, rootfs string, in Instruction, res *Result, copiedInodes map[inodeKey]string) error {
 	if len(in.Args) != 2 {
 		return fmt.Errorf("第 %d 行 COPY 需要 <src> <dst> 两个参数，得到 %d 个: %w", in.Line, len(in.Args), ErrBadInstruction)
 	}
@@ -610,17 +613,17 @@ func applyCopy(contextDir, rootfs string, in Instruction, res *Result) error {
 			}
 		}
 		for _, s := range srcList {
-			if err := copyInto(contextDir, rootfs, s, filepath.Join(dst, filepath.Base(s)), res); err != nil {
+			if err := copyInto(contextDir, rootfs, s, filepath.Join(dst, filepath.Base(s)), res, copiedInodes); err != nil {
 				return fmt.Errorf("第 %d 行 COPY %q: %w", in.Line, in.Args[0], err)
 			}
 		}
 		return nil
 	}
-	return copyInto(contextDir, rootfs, src, dst, res)
+	return copyInto(contextDir, rootfs, src, dst, res, copiedInodes)
 }
 
 // copyInto 把单个源条目写到 rootfs 内的目标路径，保留权限与符号链接语义。
-func copyInto(contextDir, rootfs, src, dst string, res *Result) error {
+func copyInto(contextDir, rootfs, src, dst string, res *Result, copiedInodes map[inodeKey]string) error {
 	// 目标路径链必须是真实目录，禁止经由符号链接写出 rootfs 之外。
 	if err := mkParents(rootfs, dst); err != nil {
 		return err
@@ -642,6 +645,23 @@ func copyInto(contextDir, rootfs, src, dst string, res *Result) error {
 			return fmt.Errorf("创建符号链接 %s: %w", dst, err)
 		}
 	case fi.Mode().IsRegular():
+		// 硬链接：同一 inode 在上下文里可能有多个名字（busybox 式镜像常见）。
+		// 若每个名字都拷一份完整内容，rootfs 会按链接数成倍膨胀——实测
+		// busybox 从 6.8 MB 涨到 280 MB。因此首次出现正常拷贝，其余建硬链接。
+		if dev, ino, nlink, ok := inodeOf(fi); ok && nlink > 1 {
+			key := inodeKey{dev: dev, ino: ino}
+			if first, dup := copiedInodes[key]; dup {
+				if err := removeAny(dst); err != nil {
+					return err
+				}
+				if err := os.Link(first, dst); err == nil {
+					return nil
+				}
+				// 跨设备等导致 link 失败时退化为独立拷贝（语义仍正确）。
+			} else {
+				copiedInodes[key] = dst
+			}
+		}
 		if err := copyRegular(src, dst, fi.Mode().Perm()); err != nil {
 			return err
 		}
@@ -657,7 +677,7 @@ func copyInto(contextDir, rootfs, src, dst string, res *Result) error {
 			return fmt.Errorf("读取目录 %s: %w", src, err)
 		}
 		for _, e := range ents {
-			if err := copyInto(contextDir, rootfs, filepath.Join(src, e.Name()), filepath.Join(dst, e.Name()), res); err != nil {
+			if err := copyInto(contextDir, rootfs, filepath.Join(src, e.Name()), filepath.Join(dst, e.Name()), res, copiedInodes); err != nil {
 				return err
 			}
 		}
@@ -994,6 +1014,9 @@ func writeLayer(rootfs, outPath string) (string, int64, error) {
 
 // tarTree 按确定顺序把 rootfs 打包：目录在前，同目录内按文件名字典序。
 func tarTree(tw *tar.Writer, rootfs string) error {
+	// seenInodes 记录 (dev, ino) → 首次出现的归档路径，用于把硬链接写成
+	// tar.TypeLink 而不是重复的文件内容（见 writeTarEntry）。
+	seenInodes := make(map[inodeKey]string)
 	return filepath.WalkDir(rootfs, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -1006,13 +1029,39 @@ func tarTree(tw *tar.Writer, rootfs string) error {
 			return fmt.Errorf("相对路径 %s: %w", p, err)
 		}
 		name := filepath.ToSlash(rel)
-		return writeTarEntry(tw, name, p)
+		return writeTarEntry(tw, name, p, seenInodes)
 	})
+}
+
+// inodeKey 唯一标识一个 inode（含设备号，跨设备不会误判）。
+type inodeKey struct {
+	dev uint64
+	ino uint64
+}
+
+// hardlinkKey 判断 name 是否为「已经写过的 inode 的又一个硬链接名字」。
+//
+// 返回 (首次出现的归档路径, true) 表示它是重复链接，调用方应写 tar.TypeLink；
+// 否则返回 ("", false)，并把本次路径登记为该 inode 的首次出现。
+//
+// nlink == 1 是绝大多数文件的常态，直接短路，避免为每个文件查表。
+// 平台不支持 inode 查询时（见 inode_other.go）恒返回 false，退化为各写一份内容。
+func hardlinkKey(fi os.FileInfo, seen map[inodeKey]string, name string) (string, bool) {
+	dev, ino, nlink, ok := inodeOf(fi)
+	if !ok || nlink <= 1 {
+		return "", false
+	}
+	key := inodeKey{dev: dev, ino: ino}
+	if first, dup := seen[key]; dup {
+		return first, true
+	}
+	seen[key] = name
+	return "", false
 }
 
 // writeTarEntry 把 one 条 rootfs 条目写进 tar：常规文件读磁盘，符号链接写目标，
 // 目录写头，socket / 设备节点 / FIFO 跳过并计数告警。
-func writeTarEntry(tw *tar.Writer, name, src string) error {
+func writeTarEntry(tw *tar.Writer, name, src string, seenInodes map[inodeKey]string) error {
 	fi, err := os.Lstat(src)
 	if err != nil {
 		return fmt.Errorf("读取 %s: %w", src, err)
@@ -1028,6 +1077,23 @@ func writeTarEntry(tw *tar.Writer, name, src string) error {
 		return tw.WriteHeader(hdr)
 
 	case fi.Mode().IsRegular():
+		// 硬链接：nlink > 1 的文件在 rootfs 里是同一份 inode 的多个名字
+		// （busybox 就是一个二进制 + 数百个 applet 名）。若每个名字都写一份
+		// 完整内容，层体积会按链接数成倍膨胀——实测 busybox 从 6.8 MB 涨到
+		// 280 MB（约 41 倍）。因此首次出现写常规文件，其余写成 hard link 条目。
+		if first, dup := hardlinkKey(fi, seenInodes, name); dup {
+			hdr, err := tar.FileInfoHeader(fi, "")
+			if err != nil {
+				return fmt.Errorf("构造硬链接头 %s: %w", name, err)
+			}
+			hdr.Name = name
+			hdr.Typeflag = tar.TypeLink
+			hdr.Linkname = first
+			hdr.Size = 0
+			hdr.Mode = int64(fi.Mode().Perm() &^ 0o7000)
+			return tw.WriteHeader(hdr)
+		}
+
 		hdr, err := tar.FileInfoHeader(fi, "")
 		if err != nil {
 			return fmt.Errorf("构造文件头 %s: %w", name, err)
