@@ -342,10 +342,38 @@ CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o licore-darwin-arm64 .
   （`runtime.CapsEnv`），与 `LICORE_NET_*` / `LICORE_MOUNT_*` / `LICORE_CGROUP_ID`
   同一约定，**不经过 `runtime.Config`**（那是冻结接口）。
 
+### exec 的收口（与容器 init 同一套）
+
+`licore exec` 走宿主侧 `nsenter`，其进程继承**宿主 root 的完整能力**——
+容器 init 的收口对它无效。因此容器启动时把 licore 自身**只读 bind** 进
+`/.licore/exec-helper`（`InstallExecHelper`，在 pivot_root **之前**，与卷挂载
+同一时机），exec 时由 nsenter 在容器内执行它：
+
+```
+nsenter ... -r/ -w/ -- /.licore/exec-helper exec-setup -- <用户命令>
+```
+
+helper（`runtime.RunExecSetup`）按**与容器 init 相同**的顺序收口后再 execve：
+no_new_privs → capability 裁剪 → seccomp。
+
+约束：
+
+- **收口顺序必须与 `executeContainerCmd` 保持一致**——两处不一致就会出现
+  "容器 1 号进程受限、exec 进程不受限"的洞。
+- **`licore exec` 只允许收紧，不允许放宽**：`--cap-add` 会被
+  `rejectCapAddForExec` 明确拒绝。允许它等于给隔离开后门（任何能 exec 的人
+  都能把 CAP_SYS_ADMIN 加回来）。
+- 只读 bind 同样遵守"先 `MS_BIND`，再 `MS_REMOUNT|MS_BIND|MS_RDONLY`"。
+- 收口规格经 `LICORE_CAPS_*` 环境变量下发，helper 在 execve 前用
+  `envWithoutLiCore` 剥掉，不泄漏进用户命令。
+- `ParseExecSetupArgs` 等纯逻辑**不带 build tag**（CLI 全平台都要注册该子命令，
+  加 tag 会让 darwin 交叉编译失败），只有 `RunExecSetup`/`InstallExecHelper`
+  是 Linux 专属 + 非 Linux stub。
+- `licore exec-setup` 必须 `DisableFlagParsing`，否则用户命令里的 `-c`
+  会被 cobra 当成自己的 flag 吃掉。
+
 ### 已知缺口（不要假定容器已完全隔离）
 
-- **`licore exec` 不受裁剪约束**：它走宿主侧 `nsenter`，继承宿主 root 的完整
-  能力。修它需要在 nsenter 之后、目标命令之前再走一遍同样的收口。
 - 无 AppArmor / SELinux 强制策略。
 - seccomp 是**黑名单**，不拦未知系统调用；`bpf` / `userfaultfd` / `kcmp` /
   `process_vm_readv` / `open_by_handle_at` / `finit_module` 等未列入
@@ -382,11 +410,13 @@ CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o licore-darwin-arm64 .
 
 **v0.8.0 已完成**：外部安全审计后的权限隔离修复 + Docker 镜像转换。
 
-- **容器权限隔离（三层，详见《容器权限隔离》一节）**：v0.8.0 之前容器在 root 下
-  运行时就是**真正的宿主 root 且持有全部 capability**，容器内可直接
+- **容器权限隔离（三层 + exec 收口，详见《容器权限隔离》一节）**：v0.8.0 之前容器在
+  root 下运行时就是**真正的宿主 root 且持有全部 capability**，容器内可直接
   `echo b > /proc/sysrq-trigger` 重启宿主、可加载 eBPF、可改写宿主 `/proc/sys`。
   现补齐 no_new_privs + capability 裁剪（默认集与 Docker 一致）+ seccomp 黑名单，
-  并新增 `--cap-add` / `--cap-drop`。**注意：真机尚未验证，见 [docs/unverified.md](docs/unverified.md)。**
+  并新增 `--cap-add` / `--cap-drop`。`licore exec` 同样收口（容器内只读 helper），
+  且 exec **只允许收紧、拒绝 --cap-add**。
+  **注意：真机尚未验证，见 [docs/unverified.md](docs/unverified.md)。**
 - **`licore convert`**：把 Docker 镜像转成 `.licore`（`docker export` 导出 rootfs +
   `docker inspect` 重建运行配置），支持单个与批量（`--from-file` / `--jobs`）。
   限制见 [docs/convert.md](docs/convert.md)——尤其是 `HEALTHCHECK` 会被**静默丢弃**。

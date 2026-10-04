@@ -22,6 +22,10 @@
 | P0-1 `PR_SET_NO_NEW_PRIVS` | ✅ | ✅ 已验（标志置上 + 跨 execve 继承）| ❌ 未验 |
 | P0-2 capability 裁剪 | ✅ | ⚠️ 仅纯逻辑与 ABI 已验 | ❌ **未验** |
 | P1 seccomp 黑名单 | ✅ | ✅ 已验（真实安装 + 真实拦截）| ❌ 未验 |
+| exec 收口（bind helper） | ✅ | ⚠️ 部分（见下节）| ❌ 未验 |
+
+> exec 的收口单列在文档末尾《`licore exec` 的收口》一节，因为它有独立的
+> 未验证项（helper 路径可达性、真实能力裁剪）。
 
 ### 逐项说明
 
@@ -93,17 +97,54 @@ Seccomp:	2                    ← P1 生效（2 = filter 模式）
 
 ---
 
-## 已知缺口（不是"未验证"，是**已确认未修**）
+## `licore exec` 的收口（已实现，未真机验证）
 
-### `licore exec` 不继承容器的权限裁剪
+**背景**：`licore exec` 走宿主侧的 `nsenter`，其进程继承的是**宿主 root 的
+完整能力**——容器 init 里的 no_new_privs / cap-drop / seccomp 对它完全无效。
+修之前，任何能执行 `licore exec` 的人都能拿到宿主 root 的全部能力，
+让三层隔离形同虚设。
 
-`licore exec` 由宿主侧的 `nsenter` 拉起（`internal/execns`），继承的是
-**宿主 root 的完整能力**，与容器 init 被裁剪成什么样无关。
+**现状（已修）**：容器启动时把 licore 自身**只读 bind** 到容器内
+`/.licore/exec-helper`；exec 时 nsenter 在容器内执行它，由它做完收口
+（no_new_privs → cap-drop → seccomp）再 execve 用户命令。
 
-后果：`licore exec <容器> /bin/sh` 进去拿到的仍是全能力，因此：
+为什么用 bind 而不是 `/proc/self/fd`：后者依赖容器内有 procfs 且
+`/proc/self/fd` 可读，Android/Magisk 环境下 procfs 参数与可见性不确定；
+bind 进来的路径在容器内**一定**可达，跨平台更稳。代价是每个容器 rootfs
+多一个只读文件。
 
-- 不要用 `licore exec ... grep CapEff` 来判断权限修复是否生效（会读到宿主位图，误判为"没修好"）；
-- 通过 `exec` 进入容器的进程不受 capability 裁剪与 seccomp 过滤器的约束。
+**能力语义（安全边界）**：
 
-**这不在本次修复范围内**，属于独立缺口。修它需要让 `exec` 路径也走一遍
-能力裁剪与 seccomp 安装（nsenter 之后、目标命令之前）。
+- exec 默认继承**容器创建时**记录的 `--cap-drop`，可再叠加本次 `--cap-drop`；
+- exec **拒绝 `--cap-add`**——允许它等于给隔离开后门。需要更多能力时用
+  `licore run` 起一个配置正确的新容器。
+
+### 未验证的部分
+
+| 项 | 沙箱内验证 | 真机验证 |
+| --- | --- | --- |
+| helper 参数解析 / 收口规格编解码 | ✅ 已验 | — |
+| 只读 bind（helper 落进 rootfs 且不可写） | ⚠️ 需 root，显式 skip | ❌ 未验 |
+| exec 收口后 NoNewPrivs=1、Seccomp=2 | ✅ 已验（子进程真跑） | ❌ 未验 |
+| seccomp 确实拦住危险调用 | ✅ 已验（unshare 探针） | ❌ 未验 |
+| capability 真实裁剪 | ❌ 需 CAP_SETPCAP | ❌ **未验** |
+| 容器内 helper 路径真的可达（端到端） | ❌ 无法起容器 | ❌ **未验** |
+
+**风险最高的是最后两项**：helper 路径可达性（若 helper 没被正确 bind 进去，
+exec 会直接失败而不是静默降级——这一点上失败是"安全"的）与 capability
+真实裁剪（若裁剪未生效，exec 出来的仍是满能力）。
+
+### 顺手验证（有 root 服务器时）
+
+```bash
+licore run -d --name captest alpine:3.20 sleep 3600
+licore exec captest /bin/sh -c 'grep -E "^(CapEff|NoNewPrivs|Seccomp):" /proc/self/status'
+licore stop captest && licore rm captest
+```
+
+修好之后，exec 进程读到的应当**也是**裁剪后的位图：
+`CapEff=00000000a80425fb`（不含 `CAP_SYS_ADMIN`）、`NoNewPrivs: 1`、`Seccomp: 2`。
+
+> 注意：这与修复前正好相反——修复前 `licore exec ... grep CapEff` 读到的是
+> **宿主**的满能力位图，那正是"exec 未收口"的症状。
+

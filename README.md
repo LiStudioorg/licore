@@ -327,24 +327,30 @@ licore run --cap-drop ALL --cap-add NET_BIND_SERVICE myapp:v1   # 清空后只�
 `--cap-add ALL` 补齐全部已知能力。默认能力集与 Docker 一致，对应位图
 `CapEff=0x00000000a80425fb`。
 
-**验证当前容器的权限状态**（读**容器 PID 1**，不要用 `exec`）：
+**验证当前容器的权限状态**：
 
 ```bash
+# 读容器 PID 1（宿主视角）
 CID=$(licore ps -q | head -1)
 INITPID=$(sed -n 's/.*"initPid"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' \
   ~/.licore/containers/$CID/runtime.json)
 grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/$INITPID/status
 # 期望：CapEff 不含 bit 21（CAP_SYS_ADMIN）、NoNewPrivs: 1、Seccomp: 2
+
+# exec 进去的进程也应当被收口（与 PID 1 同样的位图）
+licore exec "$CID" /bin/sh -c 'grep -E "^(CapEff|NoNewPrivs|Seccomp):" /proc/self/status'
 ```
+
+`exec` 走的是**容器内的只读 helper**（`/.licore/exec-helper`，容器启动时由
+LiCore 只读 bind 进去），由它做完与容器 init 相同的收口再执行用户命令。
+`licore exec` **只允许进一步收紧能力**：`--cap-drop` 可用，`--cap-add` 会被
+明确拒绝（否则等于给隔离开后门）；需要更多能力请用 `licore run` 重新起容器。
 
 完整验证脚本：[scripts/verify-capabilities.sh](scripts/verify-capabilities.sh)
 （以 root 运行；有风险的 sysrq 测试默认跳过，需 `--unsafe` 显式开启）。
 
 **已知缺口**——这些**没有**防护，不要假定容器已完全隔离：
 
-- **`licore exec` 不受裁剪约束**：它走宿主侧 `nsenter`，继承宿主 root 的完整能力。
-  因此不要用 `licore exec ... grep CapEff` 判断隔离是否生效（读到的是宿主位图），
-  也不要把 `exec` 当作受限入口。
 - **没有 AppArmor / SELinux 强制策略**；SELinux 仅继承引擎的 exec 上下文。
 - **seccomp 是黑名单**（不是 Docker 那样的白名单），因此**不拦未知系统调用**。
   另有 `bpf`、`userfaultfd`、`kcmp`、`process_vm_readv/writev`、
