@@ -96,6 +96,9 @@ type Result struct {
 	Version string
 	// Skipped 是被跳过的非常规文件数（socket / 设备节点 / FIFO）。
 	Skipped int
+	// Touched 是本次构建实际写入 rootfs 的绝对路径（COPY / WORKDIR 的产物）。
+	// 用于只把这些路径打成追加层，从而让 FROM 基础镜像时不必重打整层。
+	Touched []string
 }
 
 // Build 把一份解析好的 Boxfile 构建成新的 .licore 文件。
@@ -181,8 +184,19 @@ func Build(ctx context.Context, opts *Options) (*Result, error) {
 	}
 
 	// 4) rootfs → 追加层 tar.gz，摘要与大小边写边算。
+	//
+	// 有基础镜像时**只打包本次改动触及的路径**：基础层已在 index.json 里被
+	// 引用（见下方组装），把整个合并后的 rootfs 再打一遍会让每个派生镜像都带
+	// 一份完整的基础内容，磁盘完全省不下来。
+	// scratch 构建（无基础层）仍需整树打包，否则空层没有意义。
 	layerPath := filepath.Join(tmpDir, fmt.Sprintf("%06d.%s.tar.gz", baseCount+1, newLayerName))
-	layerDigest, layerSize, err := writeLayer(rootfs, layerPath)
+	var layerDigest string
+	var layerSize int64
+	if len(base.layers) == 0 {
+		layerDigest, layerSize, err = writeLayer(rootfs, layerPath)
+	} else {
+		layerDigest, layerSize, err = writeDeltaLayer(rootfs, res.Touched, layerPath)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -509,6 +523,7 @@ func applyInstructions(ctx context.Context, opts *Options, rootfs string, cfg *i
 			if err := os.MkdirAll(dst, defDirMode); err != nil {
 				return fmt.Errorf("第 %d 行 WORKDIR 创建 %s: %w", in.Line, in.Args[0], err)
 			}
+			res.Touched = append(res.Touched, dst)
 			cfg.WorkingDir = in.Args[0]
 		case OpEntrypoint:
 			cfg.Entrypoint = append([]string(nil), in.Args...)
@@ -591,6 +606,9 @@ func applyCopy(contextDir, rootfs string, in Instruction, res *Result, copiedIno
 		}
 		return fmt.Errorf("第 %d 行 COPY: 源路径 %q: %w", in.Line, in.Args[0], err)
 	}
+
+	// 记录本次 COPY 写入的 rootfs 路径：只有这些路径需要进追加层。
+	res.Touched = append(res.Touched, dst)
 
 	// 源是目录、或目标是已存在目录（Lstat：符号链接目标不算目录）或写成了 "/x/" 时：拷贝进目录。
 	intoDir := fi.IsDir() || strings.HasSuffix(in.Args[1], "/")
@@ -976,6 +994,112 @@ func writeReg(target string, mode fs.FileMode, r io.Reader, size int64) error {
 		err = cerr
 	}
 	return err
+}
+
+// writeDeltaLayer 把 rootfs 中「本次构建新增/修改的路径」打成追加层。
+//
+// 与 writeLayer 的区别：只遍历 touched 指向的子树，而不是整个 rootfs。
+// 这样 FROM 基础镜像构建出的派生镜像，其追加层只含自己的增量，基础内容由
+// index.json 的 layers[] 引用（同一 digest 在层存储里天然去重）。
+//
+// touched 中的路径可能互相嵌套（如先 COPY a /a 再 COPY a/b /a/b），
+// 此时保留最短的那条前缀即可，避免同一文件被打两遍。
+func writeDeltaLayer(rootfs string, touched []string, outPath string) (string, int64, error) {
+	out, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return "", 0, fmt.Errorf("创建层文件 %s: %w", outPath, err)
+	}
+	hasher := sha256.New()
+	gz := gzip.NewWriter(io.MultiWriter(out, hasher))
+	tw := tar.NewWriter(gz)
+
+	werr := tarPaths(tw, rootfs, touched)
+	if err := tw.Close(); werr == nil {
+		werr = err
+	}
+	if err := gz.Close(); werr == nil {
+		werr = err
+	}
+	if err := out.Close(); werr == nil {
+		werr = err
+	}
+	if werr != nil {
+		_ = os.Remove(outPath)
+		return "", 0, fmt.Errorf("写出增量层 %s: %w", outPath, werr)
+	}
+	fi, err := os.Stat(outPath)
+	if err != nil {
+		return "", 0, fmt.Errorf("统计层 %s: %w", outPath, err)
+	}
+	if fi.Size() > maxBuildLayerBytes {
+		return "", 0, fmt.Errorf("层 %s 达 %d 字节，超过上限 %d: %w", outPath, fi.Size(), maxBuildLayerBytes, ErrBadInstruction)
+	}
+	return "sha256:" + hex.EncodeToString(hasher.Sum(nil)), fi.Size(), nil
+}
+
+// tarPaths 把若干 rootfs 内的绝对路径（含其子树）写进 tar。
+//
+// 只接受 rootfs 之内的路径；越界路径跳过（正常不会出现，属于防御）。
+func tarPaths(tw *tar.Writer, rootfs string, paths []string) error {
+	seenInodes := make(map[inodeKey]string)
+	// 去重 + 去掉被其他路径前缀覆盖的路径，保证每个文件只打一次。
+	roots := minimalRoots(rootfs, paths)
+	for _, p := range roots {
+		if err := filepath.WalkDir(p, func(cur string, d fs.DirEntry, err error) error {
+			if err != nil {
+				// 构建过程中被删掉的路径不算错误（后续指令可以覆盖先前结果）。
+				if errors.Is(err, fs.ErrNotExist) {
+					return nil
+				}
+				return err
+			}
+			if cur == rootfs {
+				return nil
+			}
+			rel, err := filepath.Rel(rootfs, cur)
+			if err != nil {
+				return fmt.Errorf("相对路径 %s: %w", cur, err)
+			}
+			// 目录条目的尾斜杠由 writeTarEntry 统一添加（storage 侧只剥一个），
+			// 这里再拼一次会变成 "app//"，被 SafeArchivePath 判为空路径段。
+			_ = d
+			return writeTarEntry(tw, filepath.ToSlash(rel), cur, seenInodes)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// minimalRoots 过滤掉被其他路径前缀覆盖的路径，返回需要遍历的最小根集合。
+func minimalRoots(rootfs string, paths []string) []string {
+	clean := make([]string, 0, len(paths))
+	seen := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		c := filepath.Clean(p)
+		if c == rootfs || !strings.HasPrefix(c, rootfs+string(filepath.Separator)) {
+			continue // rootfs 自身或越界路径：跳过
+		}
+		if !seen[c] {
+			seen[c] = true
+			clean = append(clean, c)
+		}
+	}
+	sort.Strings(clean)
+	out := make([]string, 0, len(clean))
+	for _, c := range clean {
+		covered := false
+		for _, kept := range out {
+			if strings.HasPrefix(c, kept+string(filepath.Separator)) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // writeLayer 把 rootfs 打成 tar.gz 追加层，边写边算 tar.gz 原始字节的摘要与大小。

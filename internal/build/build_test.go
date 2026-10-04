@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"testing"
@@ -883,4 +884,188 @@ func TestImageRefOverride(t *testing.T) {
 	if loaded.Manifest.Name != "myns/demo" || loaded.Manifest.Version != "v7" {
 		t.Fatalf("清单引用错误: %s:%s", loaded.Manifest.Name, loaded.Manifest.Version)
 	}
+}
+
+// TestBuildDeltaLayerOnlyContainsChanges 关键回归：FROM 基础镜像构建时，
+// 追加层只能包含本次改动，不得把基础层内容重新打包一遍。
+// 若重打，每个派生镜像都会带一份完整基础 rootfs，分层复用形同虚设。
+func TestBuildDeltaLayerOnlyContainsChanges(t *testing.T) {
+	dir := t.TempDir()
+
+	// 基础镜像：一个 200 KiB 大文件 + 一个标记文件（足够大，重打会明显变大）。
+	baseDir := filepath.Join(dir, "base")
+	big := bytes.Repeat([]byte("B"), 200*1024)
+	writeFile(t, filepath.Join(baseDir, "big.bin"), string(big), 0o644)
+	writeFile(t, filepath.Join(baseDir, "base.txt"), "from base\n", 0o644)
+
+	bo := baseOpts(t, baseDir, `
+FROM scratch
+COPY big.bin /etc/big.bin
+COPY base.txt /etc/base.txt
+`)
+	bo.OutPath = filepath.Join(baseDir, "demo.licore")
+	baseRes, err := Build(context.Background(), bo)
+	if err != nil {
+		t.Fatalf("构建基础镜像: %v", err)
+	}
+	baseLoaded, err := image.OpenFile(baseRes.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseLayerSize := baseLoaded.Manifest.Layers[0].SizeBytes
+
+	// 派生镜像：只加一个小文件。
+	ctxDir := filepath.Join(dir, "ctx")
+	writeFile(t, filepath.Join(ctxDir, "run.sh"), "#!/bin/sh\necho hi\n", 0o755)
+	co := &Options{
+		ContextDir: ctxDir,
+		Boxfile: mustParse(t, `
+FROM demo:latest
+COPY run.sh /app/run.sh
+`),
+		BaseImage: baseRes.Path,
+		OutPath:   filepath.Join(dir, "child.licore"),
+	}
+	childRes, err := Build(context.Background(), co)
+	if err != nil {
+		t.Fatalf("基于基础镜像构建: %v", err)
+	}
+	if childRes.LayerCount != 2 {
+		t.Fatalf("层数 = %d, want 2（基础层引用 + 追加层）", childRes.LayerCount)
+	}
+
+	childLoaded, err := image.OpenFile(childRes.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layers := append([]image.Layer(nil), childLoaded.Manifest.Layers...)
+	sort.Slice(layers, func(i, j int) bool { return layers[i].ApplyOrder < layers[j].ApplyOrder })
+
+	// 第 1 层必须与基础层同 digest（引用而非复制）。
+	if layers[0].Digest != baseLoaded.Manifest.Layers[0].Digest {
+		t.Errorf("基础层 digest 被改写：got %s want %s",
+			layers[0].Digest, baseLoaded.Manifest.Layers[0].Digest)
+	}
+
+	// 追加层必须远小于基础层：重打整个 rootfs 会让两者相当。
+	if layers[1].SizeBytes >= baseLayerSize/2 {
+		t.Errorf("追加层 %d 字节，基础层 %d 字节：追加层过大，疑似重打了整个 rootfs",
+			layers[1].SizeBytes, baseLayerSize)
+	}
+
+	// 追加层里只能有这次的改动，不得混入基础层内容。
+	hdrs := layerHeaders(t, childRes.Path, layers[1].Digest)
+	if _, bad := hdrs["etc/big.bin"]; bad {
+		t.Error("追加层混入了基础层的 etc/big.bin")
+	}
+	if _, bad := hdrs["etc/base.txt"]; bad {
+		t.Error("追加层混入了基础层的 etc/base.txt")
+	}
+	if _, ok := hdrs["app/run.sh"]; !ok {
+		t.Errorf("追加层缺少 app/run.sh，实际条目: %v", keysOf(hdrs))
+	}
+}
+
+// TestBuildDeltaLayerSurvivesCopyOverBase 覆盖「COPY 覆盖基础层同名文件」：
+// 增量层必须带上被覆盖后的内容，运行时以增量层为准。
+func TestBuildDeltaLayerSurvivesCopyOverBase(t *testing.T) {
+	dir := t.TempDir()
+	baseDir := filepath.Join(dir, "base")
+	writeFile(t, filepath.Join(baseDir, "conf"), "base-version\n", 0o644)
+
+	bo := baseOpts(t, baseDir, `
+FROM scratch
+COPY conf /etc/conf
+`)
+	bo.OutPath = filepath.Join(baseDir, "demo.licore")
+	baseRes, err := Build(context.Background(), bo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctxDir := filepath.Join(dir, "ctx")
+	writeFile(t, filepath.Join(ctxDir, "conf"), "child-version\n", 0o644)
+	co := &Options{
+		ContextDir: ctxDir,
+		Boxfile:    mustParse(t, "FROM demo:latest\nCOPY conf /etc/conf\n"),
+		BaseImage:  baseRes.Path,
+		OutPath:    filepath.Join(dir, "child.licore"),
+	}
+	childRes, err := Build(context.Background(), co)
+	if err != nil {
+		t.Fatalf("构建派生镜像: %v", err)
+	}
+	childLoaded, err := image.OpenFile(childRes.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layers := append([]image.Layer(nil), childLoaded.Manifest.Layers...)
+	sort.Slice(layers, func(i, j int) bool { return layers[i].ApplyOrder < layers[j].ApplyOrder })
+
+	// 增量层必须包含被覆盖的 /etc/conf。
+	hdrs := layerHeaders(t, childRes.Path, layers[1].Digest)
+	if _, ok := hdrs["etc/conf"]; !ok {
+		t.Errorf("增量层缺少被覆盖的 etc/conf，实际条目: %v", keysOf(hdrs))
+	}
+
+	// 解包两层并按 applyOrder 合并后，/etc/conf 必须是新内容。
+	storeRoot := t.TempDir()
+	fsDirs := unpackAllLayers(t, childRes.Path, storeRoot)
+	merged := t.TempDir()
+	if err := storage.MergeLayers(storeRoot, []string{
+		strings.TrimPrefix(layers[0].Digest, "sha256:"),
+		strings.TrimPrefix(layers[1].Digest, "sha256:"),
+	}, merged); err != nil {
+		t.Fatalf("MergeLayers: %v", err)
+	}
+	_ = fsDirs
+	got, err := os.ReadFile(filepath.Join(merged, "etc", "conf"))
+	if err != nil {
+		t.Fatalf("读取合并后的 /etc/conf: %v", err)
+	}
+	if string(got) != "child-version\n" {
+		t.Errorf("合并后 /etc/conf = %q, want %q（增量层未覆盖基础层）", got, "child-version\n")
+	}
+}
+
+// TestBuildScratchStillPacksWholeRootfs scratch 构建没有基础层可引用，
+// 必须仍旧整树打包，否则镜像会是空的。
+func TestBuildScratchStillPacksWholeRootfs(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "tool.sh"), "#!/bin/sh\n", 0o755)
+	writeFile(t, filepath.Join(dir, "conf"), "x\n", 0o644)
+
+	opts := baseOpts(t, dir, `
+FROM scratch
+COPY tool.sh /bin/tool.sh
+COPY conf /etc/conf
+`)
+	opts.OutPath = filepath.Join(dir, "scratch.licore")
+	res, err := Build(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.LayerCount != 1 {
+		t.Fatalf("层数 = %d, want 1", res.LayerCount)
+	}
+	loaded, err := image.OpenFile(res.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdrs := layerHeaders(t, res.Path, loaded.Manifest.Layers[0].Digest)
+	for _, want := range []string{"bin/tool.sh", "etc/conf"} {
+		if _, ok := hdrs[want]; !ok {
+			t.Errorf("scratch 层缺少 %s，实际条目: %v", want, keysOf(hdrs))
+		}
+	}
+}
+
+// keysOf 返回 map 的键，仅用于测试失败时打印可读信息。
+func keysOf(m map[string]*tar.Header) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
