@@ -53,7 +53,12 @@ type Result struct {
 	Ref string
 	// Arch 是产物架构。
 	Arch string
-	// Path 是产出的 .licore 路径（--import 模式下为临时文件，已清理时为空）。
+	// Path 是产出的 .licore 路径，本函数返回后**仍然存在**：
+	//   - 指定了 OutPath 时就是 OutPath；
+	//   - ImportImage 模式（且未指定 OutPath）时是 work 之外的临时文件，
+	//     供调用方导入 store，**清理由调用方负责**；
+	//   - 两者都未指定时是 work 内的临时文件，随 work 一起清理，
+	//     此时不应使用该字段。
 	Path string
 	// Bytes 是产出文件字节数。
 	Bytes int64
@@ -96,6 +101,23 @@ func Convert(ctx context.Context, opts *Options) (*Result, error) {
 		_ = os.RemoveAll(work)
 	}
 	defer cleanup()
+
+	// promote 把 work 内的产物复制到 work 之外的稳定目录并返回新路径。
+	// ImportImage 模式下调用方要在 Convert 返回**之后**才去读这个文件来导入
+	// store，而 work 会被上面的 defer 删掉，所以必须先挪出来。
+	// 目标目录可能位于其它文件系统，因此用 copyFile 而不是 rename。
+	promote := func(src string) (string, error) {
+		dir, err := os.MkdirTemp(opts.WorkDir, "licore-convert-out-")
+		if err != nil {
+			return "", fmt.Errorf("convert: 创建产出目录失败: %w", err)
+		}
+		dst := filepath.Join(dir, filepath.Base(src))
+		if err := copyFile(src, dst); err != nil {
+			_ = os.RemoveAll(dir)
+			return "", fmt.Errorf("convert: 保存产出失败: %w", err)
+		}
+		return dst, nil
+	}
 
 	platform := "linux/" + arch
 	// 磁盘预检：pull + export + 解压会同时占用三份空间（镜像、tar、rootfs），
@@ -222,13 +244,25 @@ func Convert(ctx context.Context, opts *Options) (*Result, error) {
 		return nil, fmt.Errorf("convert: 构建失败: %w", err)
 	}
 
-	// 7. 输出：写文件 或 导入本地。
+	// 7. 输出：写文件 或 留给调用方导入。
+	//
+	// ImportImage 模式下调用方（CLI）需要在本函数返回之后继续读这个文件去
+	// 导入 store，因此不能把它留在 work 里——defer 会把 work 删掉，调用方
+	// 拿到的是一个悬空路径（历史 bug）。promote 把它挪到 work 之外的稳定
+	// 目录，清理责任转移给调用方。
 	finalPath := outPath
-	if opts.OutPath != "" {
+	switch {
+	case opts.OutPath != "":
 		if err := copyFile(outPath, opts.OutPath); err != nil {
 			return nil, fmt.Errorf("convert: 写出 %s 失败: %w", opts.OutPath, err)
 		}
 		finalPath = opts.OutPath
+	case opts.ImportImage:
+		promoted, err := promote(outPath)
+		if err != nil {
+			return nil, err
+		}
+		finalPath = promoted
 	}
 	fi, err := os.Stat(finalPath)
 	if err != nil {

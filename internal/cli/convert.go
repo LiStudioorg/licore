@@ -6,6 +6,7 @@ package cli
 import (
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -110,9 +111,14 @@ func newConvertCommand(out io.Writer) *cobra.Command {
 			}
 
 			fmt.Fprintf(out, "已转换 %s（%s，%s）\n", res.Ref, res.Arch, humanSize(res.Bytes))
-			fmt.Fprintf(out, "输出：%s\n", res.Path)
+			if !importIt {
+				fmt.Fprintf(out, "输出：%s\n", res.Path)
+			}
 
 			if importIt {
+				// Convert 在 --import 模式下把产物放在 work 之外的临时文件里
+				// 交给调用方导入，清理也由调用方负责（见 convert.Result.Path）。
+				defer func() { _ = os.RemoveAll(filepath.Dir(res.Path)) }()
 				st, err := store.Open(dataDir)
 				if err != nil {
 					return err
