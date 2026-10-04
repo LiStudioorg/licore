@@ -77,7 +77,7 @@ func runPull(out io.Writer, srcPath string, force bool, rootDir string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := st.Put(srcPath, force)
+	loaded, err := st.Put(srcPath, force, false)
 	if err != nil {
 		return fmt.Errorf("pull %s: %w", srcPath, err)
 	}

@@ -70,13 +70,20 @@ func (s *Store) Exists(name, version string) (bool, error) {
 
 // Put 校验并落地一个本地 .licore 文件。已存在且 force=false 时返回 ErrExists。
 // 落地是原子的：先写入临时目录，全部成功后 rename。
-func (s *Store) Put(srcPath string, force bool) (*image.Loaded, error) {
+//
+// allowArchMismatch 对应规范第 4 节规则 6 的 `--allow-arch-mismatch` 逃生口：
+// 为 false 时镜像 architecture/os 必须与宿主匹配（默认，防交叉镜像被误跑）；
+// 为 true 时跳过该校验，供 `licore build --arch <其他架构>` 交叉构建与显式
+// 导入交叉镜像使用——产物仍会被完整校验层摘要，只是不再比对宿主平台。
+func (s *Store) Put(srcPath string, force, allowArchMismatch bool) (*image.Loaded, error) {
 	loaded, err := image.OpenFile(srcPath)
 	if err != nil {
 		return nil, err
 	}
-	if err := loaded.CheckPlatform(); err != nil {
-		return nil, err
+	if !allowArchMismatch {
+		if err := loaded.CheckPlatform(); err != nil {
+			return nil, err
+		}
 	}
 	if err := loaded.VerifyLayers(); err != nil {
 		return nil, err

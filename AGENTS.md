@@ -440,7 +440,7 @@ func (s *Store) IsStoppedByUser(id string) bool
 func (s *Store) BootEligible(cfg *ContainerConfig) bool
 
 // 镜像落地
-func (s *Store) Put(srcPath string, force bool) (*image.Loaded, error)
+func (s *Store) Put(srcPath string, force, allowArchMismatch bool) (*image.Loaded, error)
 func (s *Store) Exists(name, version string) (bool, error)
 func (s *Store) ReadState(name, version string) (*State, error)
 func (s *Store) ListImages() ([]ImageInfo, error)
@@ -461,6 +461,13 @@ ErrExists, ErrContainerExists, ErrContainerNotFound, ErrBadContainerConfig
 
 - `ContainerConfig` 的 JSON 字段为 `run`/`boot`/`shim`/`ps` 共用契约；**新增字段必须 omitempty**，
   且旧版本读新配置不得失败（向后兼容是硬要求）。
+- `Put` 的 `allowArchMismatch` 对应规范第 4 节规则 6 的 `--allow-arch-mismatch`：为 `false` 时
+  镜像平台须与宿主匹配；为 `true` 时跳过该校验，供 `licore build --arch <其他架构>` 交叉构建
+  与显式导入异构镜像使用（层摘要仍会完整校验）。**v0.7.4 由 `Put(srcPath, force)` 变更为
+  `Put(srcPath, force, allowArchMismatch)`**：原签名无逃生口，导致交叉构建的产物在自动导入
+  阶段被 `CheckPlatform` 拒绝，用户只能手工改 `index.json` 再重打包。
+- `licore pull` 与 `licore load`/`import` 走 `allowArchMismatch=false`（默认严格）；
+  仅 `licore build --arch` 显式指定架构时传 `true`。
 - 文件写入一律"临时文件 + rename"原子替换；容器目录内的临时文件必须与目标同目录（跨设备 rename 报 EXDEV）。
 - `RuntimeState` 的写方只有 shim（前台模式下是持有容器的 CLI 进程）；其他模块只读。
 

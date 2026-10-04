@@ -159,12 +159,21 @@ func SaveImage(st *store.Store, ref, dst string, force bool) error {
 	return ExportImage(st, ref, dst, force)
 }
 
+// ImportOptions 是 ImportImage 的可选项，零值即"按当前平台校验、不覆盖已有镜像"。
+type ImportOptions struct {
+	// Force 表示同名镜像已存在时覆盖重构建。
+	Force bool
+	// AllowArchMismatch 跳过宿主平台校验，供交叉构建（`licore build --arch`）
+	// 与显式导入异构镜像使用，对应规范第 4 节规则 6 的 --allow-arch-mismatch。
+	AllowArchMismatch bool
+}
+
 // ImportImage 校验并落地一个本地 .licore 文件（等价 `licore pull`，供 `licore load` 使用）。
 // dstRef 非空且与清单自带引用不同时，额外在 store 中登记一份 dstRef 的副本。
 //
-// 幂等语义：清单自带引用已存在时不再重复落地（除非 force），
+// 幂等语义：清单自带引用已存在时不再重复落地（除非 Force），
 // 这样"load 一个已导入的文件只是为了加上另一个 tag"不会被误判成冲突。
-func ImportImage(st *store.Store, src, dstRef string, force bool) (*image.Loaded, error) {
+func ImportImage(st *store.Store, src, dstRef string, opts ImportOptions) (*image.Loaded, error) {
 	if st == nil {
 		return nil, fmt.Errorf("store 为空")
 	}
@@ -180,12 +189,12 @@ func ImportImage(st *store.Store, src, dstRef string, force bool) (*image.Loaded
 	}
 	switch {
 	case !exists:
-		loaded, err = st.Put(src, force)
+		loaded, err = st.Put(src, opts.Force, opts.AllowArchMismatch)
 		if err != nil {
 			return nil, fmt.Errorf("load %s: %w", src, err)
 		}
-	case force:
-		loaded, err = st.Put(src, true)
+	case opts.Force:
+		loaded, err = st.Put(src, true, opts.AllowArchMismatch)
 		if err != nil {
 			return nil, fmt.Errorf("load %s: %w", src, err)
 		}
@@ -201,7 +210,7 @@ func ImportImage(st *store.Store, src, dstRef string, force bool) (*image.Loaded
 		slog.Info("镜像已导入", "ref", m.Ref(), "path", st.ImageDir(m.Name, m.Version))
 		return loaded, nil
 	}
-	if err := Retag(st, m.Ref(), dstRef, force); err != nil {
+	if err := Retag(st, m.Ref(), dstRef, opts.Force); err != nil {
 		return nil, fmt.Errorf("load --tag %s: %w", dstRef, err)
 	}
 	return loaded, nil

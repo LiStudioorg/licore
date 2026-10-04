@@ -312,7 +312,7 @@ func TestImageOpsRoundTrip(t *testing.T) {
 
 	// load：落进另一个 store，并按 --tag 额外登记一个引用。
 	dst := &store.Store{Root: filepath.Join(work, "dst")}
-	loaded, err := ImportImage(dst, exported, "", false)
+	loaded, err := ImportImage(dst, exported, "", ImportOptions{})
 	if err != nil {
 		t.Fatalf("ImportImage 失败: %v", err)
 	}
@@ -322,7 +322,7 @@ func TestImageOpsRoundTrip(t *testing.T) {
 	if _, err := dst.ReadState("alice/tiny", "v1"); err != nil {
 		t.Fatalf("load 落地失败: %v", err)
 	}
-	if _, err := ImportImage(dst, exported, "bob/copy:v9", false); err != nil {
+	if _, err := ImportImage(dst, exported, "bob/copy:v9", ImportOptions{}); err != nil {
 		t.Fatalf("ImportImage --tag 失败: %v", err)
 	}
 	copied, err := dst.ReadState("bob/copy", "v9")

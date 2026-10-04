@@ -120,7 +120,7 @@ func newLoadCommand(out io.Writer) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			loaded, err := ImportImage(st, src, "", true)
+			loaded, err := ImportImage(st, src, "", ImportOptions{Force: true})
 			if err != nil {
 				return err
 			}
@@ -174,7 +174,7 @@ func newImportCommand(out io.Writer) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			loaded, err := ImportImage(st, args[0], "", true)
+			loaded, err := ImportImage(st, args[0], "", ImportOptions{Force: true})
 			if err != nil {
 				return err
 			}

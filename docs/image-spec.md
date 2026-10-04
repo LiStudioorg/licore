@@ -89,7 +89,7 @@ UTF-8 JSON，无 BOM，允许任意空白，解析器必须容忍键序。Schema
 | `mediaType` | string | ✅ | 固定 `application/x.licore.manifest+json`，不匹配即拒绝 |
 | `specVersion` | string | ✅ | 固定 `licore/image-spec/v1`；未来仅允许递增此值做不兼容升级 |
 | `schemaVersion` | int | ✅ | 当前固定 `1` |
-| `architecture` | string | ✅ | `amd64` / `arm64` / `386` / `riscv64` / `loong64`（与 `GOARCH` 对齐） |
+| `architecture` | string | ✅ | `amd64` / `arm64` / `arm` / `386` / `riscv64` / `loong64`（与 `GOARCH` 对齐） |
 | `os` | string | ✅ | `linux` / `android` / `darwin`（与 `GOOS` 对齐；android 视为 linux 的发行形态，由镜像自述） |
 | `created` | string | ✅ | RFC 3339 UTC，秒精度 |
 | `name` | string | ✅ | 镜像仓库名 `^[a-z0-9][a-z0-9._/-]{0,254}$`，用于默认命名，不作校验锚 |

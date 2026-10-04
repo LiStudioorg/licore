@@ -707,6 +707,75 @@ func TestBuildOverwritesExistingOutput(t *testing.T) {
 }
 
 // TestBuildRespectsPlatformOverrides 断言 Architecture / OS 覆盖生效。
+// TestBuildArchTable 逐个架构参数构建，断言产出的 index.json
+// architecture 字段正确——`licore build --arch` 的核心行为。
+func TestBuildArchTable(t *testing.T) {
+	for _, arch := range image.SupportedArches() {
+		t.Run(arch, func(t *testing.T) {
+			dir := t.TempDir()
+			opts := baseOpts(t, dir, "FROM scratch\n")
+			opts.Architecture = arch
+			res, err := Build(context.Background(), opts)
+			if err != nil {
+				t.Fatalf("Build(--arch %s): %v", arch, err)
+			}
+			loaded, err := image.OpenFile(res.Path)
+			if err != nil {
+				t.Fatalf("OpenFile: %v", err)
+			}
+			if loaded.Manifest.Architecture != arch {
+				t.Errorf("architecture = %q, want %q", loaded.Manifest.Architecture, arch)
+			}
+			// 产物必须能被自己的校验器接受：这正是旧实现缺 --arch 时
+			// 手工改 index.json 才能绕过的坏包风险。
+			if err := loaded.Manifest.Validate(); err != nil {
+				t.Errorf("产物清单未通过 Validate: %v", err)
+			}
+		})
+	}
+}
+
+// TestBuildArchDefaultsToHost 断言不传 --arch 时跟随宿主 GOARCH（向后兼容）。
+func TestBuildArchDefaultsToHost(t *testing.T) {
+	dir := t.TempDir()
+	opts := baseOpts(t, dir, "FROM scratch\n")
+	res, err := Build(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	loaded, err := image.OpenFile(res.Path)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	if loaded.Manifest.Architecture != runtime.GOARCH {
+		t.Errorf("architecture = %q, want 宿主 %q", loaded.Manifest.Architecture, runtime.GOARCH)
+	}
+}
+
+// TestBuildOSTable 覆盖 --os 参数。
+func TestBuildOSTable(t *testing.T) {
+	for _, osName := range image.SupportedOSes() {
+		t.Run(osName, func(t *testing.T) {
+			dir := t.TempDir()
+			opts := baseOpts(t, dir, "FROM scratch\n")
+			opts.OS = osName
+			res, err := Build(context.Background(), opts)
+			if err != nil {
+				t.Fatalf("Build(--os %s): %v", osName, err)
+			}
+			loaded, err := image.OpenFile(res.Path)
+			if err != nil {
+				t.Fatalf("OpenFile: %v", err)
+			}
+			if loaded.Manifest.OS != osName {
+				t.Errorf("os = %q, want %q", loaded.Manifest.OS, osName)
+			}
+		})
+	}
+}
+
+// TestBuildRespectsPlatformOverrides 断言 arm64 + linux 组合同时生效
+// （交叉构建 arm64 镜像的主用例）。
 func TestBuildRespectsPlatformOverrides(t *testing.T) {
 	dir := t.TempDir()
 	opts := baseOpts(t, dir, "FROM scratch\n")

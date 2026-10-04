@@ -19,6 +19,7 @@ import (
 
 	"github.com/LiStudioorg/licore/internal/build"
 	"github.com/LiStudioorg/licore/internal/dev"
+	"github.com/LiStudioorg/licore/internal/image"
 	"github.com/LiStudioorg/licore/internal/store"
 )
 
@@ -38,6 +39,8 @@ func newBuildCommand(out io.Writer) *cobra.Command {
 		dataDir    string
 		noCache    bool
 		slim       bool
+		arch       string
+		osName     string
 	)
 	cmd := &cobra.Command{
 		Use:   "build [--file Boxfile] [--tag NAME:VERSION] (--context DIR | <context>)",
@@ -46,7 +49,10 @@ func newBuildCommand(out io.Writer) *cobra.Command {
 			"LABEL/USER/ARG），对基础镜像或 scratch 执行指令，构造一个 .licore " +
 			"镜像并自动 licore pull 导入本地 store。\n" +
 			"构建上下文（COPY 源目录）必须显式指定：末尾位置参数或 --context，" +
-			"想用当前目录就传 \".\"。",
+			"想用当前目录就传 \".\"。\n" +
+			"--arch/--os 覆盖产物的平台字段，默认跟随宿主，交叉构建 arm64 等镜像时用得上。\n" +
+			"注意：COPY 的源路径必须逐层列出（如 COPY etc /etc），**不支持 COPY . /**；" +
+			"要复制整个上下文请按目录逐个写，详见 docs/image-spec.md。",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctxDir, err := resolveBuildContext(contextDir, args)
@@ -54,6 +60,17 @@ func newBuildCommand(out io.Writer) *cobra.Command {
 				return err
 			}
 			contextDir = ctxDir
+			// 平台字段校验：留空跟随宿主（向后兼容），显式给出则必须落在
+			// 镜像规范 3.1 的枚举内——否则构建会"成功"产出一个 pull 立刻
+			// 拒绝的坏包，错误必须在这里就暴露。
+			if arch != "" && !image.ValidArch(arch) {
+				return fmt.Errorf("build: --arch %q 不受支持，可选值：%s: %w",
+					arch, strings.Join(image.SupportedArches(), " / "), build.ErrBadInstruction)
+			}
+			if osName != "" && !image.ValidOS(osName) {
+				return fmt.Errorf("build: --os %q 不受支持，可选值：%s: %w",
+					osName, strings.Join(image.SupportedOSes(), " / "), build.ErrBadInstruction)
+			}
 			// Boxfile 路径：--file 优先，其次 <context>/Boxfile|boxfile。
 			if file == "" {
 				cand := []string{filepath.Join(contextDir, "Boxfile"), filepath.Join(contextDir, "boxfile")}
@@ -111,12 +128,14 @@ func newBuildCommand(out io.Writer) *cobra.Command {
 
 			name, version := splitBuildTag(tag)
 			res, err := build.Build(cmd.Context(), &build.Options{
-				Boxfile:    bf,
-				ContextDir: contextDir,
-				BaseImage:  basePath,
-				OutPath:    outPath,
-				Name:       name,
-				Version:    version,
+				Boxfile:      bf,
+				ContextDir:   contextDir,
+				BaseImage:    basePath,
+				OutPath:      outPath,
+				Name:         name,
+				Version:      version,
+				Architecture: arch,
+				OS:           osName,
 			})
 			if err != nil {
 				return err
@@ -124,7 +143,10 @@ func newBuildCommand(out io.Writer) *cobra.Command {
 
 			// 自动导入本地 store（等价 licore pull）。
 			dstRef := tag
-			loaded, err := ImportImage(st, res.Path, dstRef, true /* 覆盖重构建同名 */)
+			loaded, err := ImportImage(st, res.Path, dstRef, ImportOptions{
+				Force:             true,       // 覆盖重构建同名
+				AllowArchMismatch: arch != "", // --arch 交叉构建：产物架构与宿主不同是预期内的
+			})
 			if err != nil {
 				return fmt.Errorf("build: 导入产物失败: %w", err)
 			}
@@ -137,6 +159,8 @@ func newBuildCommand(out io.Writer) *cobra.Command {
 	cmd.Flags().StringVarP(&file, "file", "f", "", "Boxfile 路径（默认 <context>/Boxfile 或 ./Boxfile）")
 	cmd.Flags().StringVarP(&tag, "tag", "t", "", "镜像引用 NAME:VERSION（默认由 Boxfile FROM 或文件名派生）")
 	cmd.Flags().StringVarP(&contextDir, "context", "", "", "构建上下文目录（COPY 源相对它解析；与末尾位置参数二选一）")
+	cmd.Flags().StringVar(&arch, "arch", "", "产物 architecture（"+strings.Join(image.SupportedArches(), "/")+"；默认跟随宿主 GOARCH）")
+	cmd.Flags().StringVar(&osName, "os", "", "产物 os（"+strings.Join(image.SupportedOSes(), "/")+"；默认跟随宿主 GOOS）")
 	cmd.Flags().StringVar(&dataDir, "data-dir", "", "数据目录（默认 $LICORE_HOME 或 ~/.licore）")
 	cmd.Flags().BoolVar(&noCache, "no-cache", false, "禁用构建缓存（LiCore 始终从基础镜像重建）")
 	cmd.Flags().BoolVar(&slim, "slim", false, "构建精简镜像（当前与常规构建同）")

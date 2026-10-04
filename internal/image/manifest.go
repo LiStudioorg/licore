@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -35,8 +36,36 @@ var (
 // supportedOS / supportedArch 是规范 3.1 允许的枚举值。
 var (
 	supportedOS  = map[string]bool{"linux": true, "android": true, "darwin": true}
-	supportedArc = map[string]bool{"amd64": true, "arm64": true, "386": true, "riscv64": true, "loong64": true}
+	supportedArc = map[string]bool{"amd64": true, "arm64": true, "arm": true, "386": true, "riscv64": true, "loong64": true}
 )
+
+// SupportedArches 返回规范 3.1 允许的 architecture 枚举值（已排序）。
+// 供 CLI 的 --arch 校验复用，避免命令行白名单与规范漂移——两边一旦不一致，
+// 就会出现"构建成功但 pull 立刻拒绝"的坏包。
+func SupportedArches() []string {
+	out := make([]string, 0, len(supportedArc))
+	for a := range supportedArc {
+		out = append(out, a)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ValidArch 报告 a 是否为规范允许的 architecture 值。
+func ValidArch(a string) bool { return supportedArc[a] }
+
+// SupportedOSes 返回规范 3.1 允许的 os 枚举值（已排序）。
+func SupportedOSes() []string {
+	out := make([]string, 0, len(supportedOS))
+	for o := range supportedOS {
+		out = append(out, o)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ValidOS 报告 o 是否为规范允许的 os 值。
+func ValidOS(o string) bool { return supportedOS[o] }
 
 // Layer 描述 index.json 中声明的一个层。
 type Layer struct {

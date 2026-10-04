@@ -311,7 +311,7 @@ func (cc *composeCmd) buildService(out io.Writer, cmd *cobra.Command, st *store.
 	if err != nil {
 		return err
 	}
-	if _, err := ImportImage(st, res.Path, tag, true); err != nil {
+	if _, err := ImportImage(st, res.Path, tag, ImportOptions{Force: true}); err != nil {
 		return fmt.Errorf("compose up 导入服务 %s 产物: %w", s.Name, err)
 	}
 	s.Image = tag

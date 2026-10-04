@@ -7,14 +7,18 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/LiStudioorg/licore/internal/build"
+	"github.com/LiStudioorg/licore/internal/image"
+	"github.com/LiStudioorg/licore/internal/store"
 )
 
 // writeCtx 造一个最小可构建的上下文目录：Boxfile（FROM scratch + COPY 一个
@@ -217,5 +221,131 @@ func TestBuildBoxfileFoundInContext(t *testing.T) {
 
 	if _, err := runBuild(t, cwd, "-t", "ctx/bf:v1", "--data-dir", home, there); err != nil {
 		t.Fatalf("Boxfile 应从上下文目录解析: %v", err)
+	}
+}
+
+// -------- --arch / --os --------
+
+// readStoredArch 读取已落地镜像持久化的 index.json，返回 architecture/os。
+// 断言查的是**落地产物**而不是构建期临时文件（后者构建结束即删），
+// 这正是旧流程里用户不得不手工编辑的那个文件。
+func readStoredArch(t *testing.T, home, name, version string) (string, string) {
+	t.Helper()
+	st, err := store.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(st.ImageDir(name, version), "index.json"))
+	if err != nil {
+		t.Fatalf("读取落地 index.json: %v", err)
+	}
+	var m struct {
+		Architecture string `json:"architecture"`
+		OS           string `json:"os"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("解析 index.json: %v", err)
+	}
+	return m.Architecture, m.OS
+}
+
+// TestBuildArchFlagRecordsArchitecture 逐个架构构建，断言落地的 index.json
+// 里 architecture 就是 --arch 指定的值——这是修复的核心诉求。
+func TestBuildArchFlagRecordsArchitecture(t *testing.T) {
+	for _, arch := range image.SupportedArches() {
+		t.Run(arch, func(t *testing.T) {
+			home := t.TempDir()
+			cwd := writeCtx(t, "arch_"+arch)
+			if _, err := runBuild(t, cwd, "-t", "archtest/img:v1", "--arch", arch, "--data-dir", home, cwd); err != nil {
+				t.Fatalf("build --arch %s: %v", arch, err)
+			}
+			gotArch, _ := readStoredArch(t, home, "archtest/img", "v1")
+			if gotArch != arch {
+				t.Errorf("index.json architecture = %q, want %q", gotArch, arch)
+			}
+		})
+	}
+}
+
+// TestBuildArchFlagCrossArchImports 交叉架构产物必须能落地成功：
+// 旧实现在导入阶段被 CheckPlatform 拒绝，用户只能手工改 index.json 再重打包。
+func TestBuildArchFlagCrossArchImports(t *testing.T) {
+	home := t.TempDir()
+	cwd := writeCtx(t, "crossarch")
+	// 只在宿主不是 arm64 时才有交叉意义；amd64/arm64 都覆盖不到就当回归测试。
+	out, err := runBuild(t, cwd, "-t", "cross/img:v1", "--arch", "arm64", "--data-dir", home, cwd)
+	if err != nil {
+		t.Fatalf("交叉构建 arm64 应可导入: %v", err)
+	}
+	if !strings.Contains(out, "arm64") && runtime.GOARCH != "arm64" {
+		t.Logf("输出未提及架构（非强制）: %s", out)
+	}
+	gotArch, _ := readStoredArch(t, home, "cross/img", "v1")
+	if gotArch != "arm64" {
+		t.Errorf("architecture = %q, want arm64", gotArch)
+	}
+	// 落地目录必须真的存在 index.json 与 source.licore。
+	st, _ := store.Open(home)
+	dir := st.ImageDir("cross/img", "v1")
+	for _, f := range []string{"index.json", "source.licore", "state.json"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
+			t.Errorf("落地目录缺少 %s: %v", f, err)
+		}
+	}
+}
+
+// TestBuildArchDefaultsToHost 不传 --arch 时跟随宿主（向后兼容）。
+func TestBuildArchDefaultsToHost(t *testing.T) {
+	home := t.TempDir()
+	cwd := writeCtx(t, "defarch")
+	if _, err := runBuild(t, cwd, "-t", "deftest/arch:v1", "--data-dir", home, cwd); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	gotArch, _ := readStoredArch(t, home, "deftest/arch", "v1")
+	if gotArch != runtime.GOARCH {
+		t.Errorf("architecture = %q, want 宿主 %q", gotArch, runtime.GOARCH)
+	}
+}
+
+// TestBuildArchFlagRejectsInvalid 非法架构必须在构建前报错并列出可选值，
+// 而不是构建出一个 pull 立刻拒绝的坏包。
+func TestBuildArchFlagRejectsInvalid(t *testing.T) {
+	for _, bad := range []string{"sparc64", "ARM64", "x86", "armv7", "loongarch64"} {
+		t.Run(bad, func(t *testing.T) {
+			home := t.TempDir()
+			cwd := writeCtx(t, "badarch")
+			out, err := runBuild(t, cwd, "-t", "bad/arch:v1", "--arch", bad, "--data-dir", home, cwd)
+			if err == nil {
+				t.Fatalf("--arch %q 必须拒绝，输出=%s", bad, out)
+			}
+			if !strings.Contains(err.Error(), "不受支持") {
+				t.Errorf("错误应说明不受支持: %v", err)
+			}
+			if !strings.Contains(err.Error(), "arm64") {
+				t.Errorf("错误应列出可选值: %v", err)
+			}
+		})
+	}
+}
+
+// TestBuildOSFlagRejectsInvalid 非法 --os 同样在构建前拒绝。
+func TestBuildOSFlagRejectsInvalid(t *testing.T) {
+	home := t.TempDir()
+	cwd := writeCtx(t, "bados")
+	if _, err := runBuild(t, cwd, "-t", "bad/os:v1", "--os", "windows", "--data-dir", home, cwd); err == nil {
+		t.Fatal("--os windows 必须拒绝")
+	}
+}
+
+// TestBuildOSFlagRecordsOS 合法 --os 写入落地 index.json。
+func TestBuildOSFlagRecordsOS(t *testing.T) {
+	home := t.TempDir()
+	cwd := writeCtx(t, "okos")
+	if _, err := runBuild(t, cwd, "-t", "ostest/x:v1", "--os", "linux", "--arch", "arm64", "--data-dir", home, cwd); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	gotArch, gotOS := readStoredArch(t, home, "ostest/x", "v1")
+	if gotOS != "linux" || gotArch != "arm64" {
+		t.Errorf("平台 = %s/%s, want linux/arm64", gotOS, gotArch)
 	}
 }

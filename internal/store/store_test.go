@@ -114,7 +114,7 @@ func TestPutAndExists(t *testing.T) {
 		t.Fatalf("初始 Exists = (%v, %v)，期望 (false, nil)", ok, err)
 	}
 
-	loaded, err := st.Put(src, false)
+	loaded, err := st.Put(src, false, false)
 	if err != nil {
 		t.Fatalf("Put 失败: %v", err)
 	}
@@ -148,13 +148,13 @@ func TestPutAndExists(t *testing.T) {
 func TestPutTwiceRequiresForce(t *testing.T) {
 	src := buildValidLiCore(t)
 	st := &Store{Root: t.TempDir()}
-	if _, err := st.Put(src, false); err != nil {
+	if _, err := st.Put(src, false, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.Put(src, false); !errors.Is(err, ErrExists) {
+	if _, err := st.Put(src, false, false); !errors.Is(err, ErrExists) {
 		t.Fatalf("重复 Put err = %v, want ErrExists", err)
 	}
-	if _, err := st.Put(src, true); err != nil {
+	if _, err := st.Put(src, true, false); err != nil {
 		t.Fatalf("--force Put 失败: %v", err)
 	}
 }
@@ -177,7 +177,7 @@ func TestPutRejectsCorrupt(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := &Store{Root: t.TempDir()}
-	if _, err := st.Put(bad, false); err == nil {
+	if _, err := st.Put(bad, false, false); err == nil {
 		t.Fatal("损坏镜像竟然落地成功")
 	}
 	// 失败后不留残留目录。
