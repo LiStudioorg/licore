@@ -291,6 +291,74 @@ CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -o licore-android-arm64 .
 CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o licore-darwin-arm64 .
 ```
 
+## 容器权限隔离（v0.8.0 起）
+
+**这是安全属性，不是可选优化。改动这一节前必须读懂每条"为什么"。**
+
+背景：root 下运行时 `nsplan_linux.go` 的判定**不**附加 `CLONE_NEWUSER`
+（理由是加了会把容器内 root 映射成普通用户、失去挂载能力）。因此容器 init
+是**真正的宿主 root**。v0.8.0 之前没有任何裁剪，容器内可以直接
+`echo b > /proc/sysrq-trigger` 重启宿主。
+
+三层防护，全部在 `internal/runtime/init_linux.go` 的 `executeContainerCmd`
+里实现，顺序即安全属性：
+
+| 顺序 | 措施 | 实现位置 |
+| --- | --- | --- |
+| 1 | `PR_SET_NO_NEW_PRIVS` | `setNoNewPrivs()`（init_linux.go） |
+| 2 | capability 裁剪（清边界集 → capset） | `capability_linux.go` |
+| 3 | seccomp 黑名单 | `seccomp_linux.go` |
+| 4 | SELinux exec 上下文（仅继承，非强制） | `inheritSELinuxContext()` |
+| 5 | `execve` | — |
+
+### 三条不可违反的约束
+
+1. **收口位置必须在所有特权准备之后、`execve` 之前。**
+   mount / `pivot_root` / `BringUpLoopback` / `ConfigurePeer` 都需要完整能力，
+   提前收口会让容器直接启动失败；晚于 `execve` 则用户命令带着完整能力跑。
+   这是 init 交出控制权前的唯一正确收口点。
+
+2. **capability 裁剪的顺序不可交换：先清边界集，再 `capset`。**
+   `PR_CAPBSET_DROP` 要求有效集里有 `CAP_SETPCAP`；先 `capset` 把集合降下来
+   之后就再也清不动边界集，剩余能力会留给子进程 exec 重新获得。
+
+3. **seccomp 的带参数规则必须排在所有无条件规则之后。**
+   带参数规则会重新加载 `args[0]`，冲掉累加器里的 `nr`；若其后还有 `JEQ nr`
+   比较，那些比较就是拿 `args[0]` 低 32 位去比，结果是**静默放行**。
+   `buildSeccompFilter` 用两趟构造保证顺序，**不要**改成单趟。
+
+### 其它实现约束
+
+- **`AUDIT_ARCH` 未知时必须返回错误，不能返回 0。** 返回 0 会让 arch 校验恒不等，
+  把容器里**所有**系统调用都拒掉，比不装过滤器严重得多。
+- **标准库常量覆盖不齐**：`syscall.Prctl`、`PR_SET_NO_NEW_PRIVS`、`CAP_*`
+  以及部分 `SYS_*`（`SYS_BPF`、`SYS_KCMP`、`SYS_IOPL` …）都不存在或不通用。
+  因此 seccomp 的架构专属项按 `seccomp_arch_*_linux.go` 分成 x86 / arm32 /
+  arm64+riscv64 三层——写在一起会让非 x86 交叉编译失败。**不要合并它们。**
+- **`AUDIT_ARCH` 与 syscall 号都是架构相关的**，不许硬编码单架构的值。
+- 拦截动作统一 `SECCOMP_RET_ERRNO|EPERM` 而非 `KILL`：进程能给出可读错误，
+  容器不会静默消失（Docker 默认也是 EPERM）。
+- capability 与 seccomp 的规格经 `LICORE_CAPS_*` 环境变量下发
+  （`runtime.CapsEnv`），与 `LICORE_NET_*` / `LICORE_MOUNT_*` / `LICORE_CGROUP_ID`
+  同一约定，**不经过 `runtime.Config`**（那是冻结接口）。
+
+### 已知缺口（不要假定容器已完全隔离）
+
+- **`licore exec` 不受裁剪约束**：它走宿主侧 `nsenter`，继承宿主 root 的完整
+  能力。修它需要在 nsenter 之后、目标命令之前再走一遍同样的收口。
+- 无 AppArmor / SELinux 强制策略。
+- seccomp 是**黑名单**，不拦未知系统调用；`bpf` / `userfaultfd` / `kcmp` /
+  `process_vm_readv` / `open_by_handle_at` / `finit_module` 等未列入
+  （标准库未导出常量，手写各架构号的风险高于收益）。
+
+### 验证
+
+- 无法在无特权环境验证真实裁剪：`PR_CAPBSET_DROP` 需要 `CAP_SETPCAP`，
+  相关用例会**显式 skip**（不是静默通过）。seccomp 的安装与拦截可以无特权验证。
+- 真机验证脚本：`scripts/verify-capabilities.sh`（读**容器 PID 1**，不是 exec 进程）。
+- **未验证项的权威清单：[docs/unverified.md](docs/unverified.md)。**
+  新增未在真机验证的安全能力时，必须在那里登记。
+
 ## 镜像格式：唯一规范在 docs/image-spec.md
 
 `.licore` = 外层未压缩 tar（内含 `index.json` + `layers/NNNNNN.<name>.tar.gz` + 可选 `blobs/`）。
@@ -310,7 +378,20 @@ CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o licore-darwin-arm64 .
 
 除此之外的第三方依赖一律不批；容器 / 镜像 / OCI / cgroups 相关库永久禁止（见"禁止事项"）。日志、配置、压缩、归档一律用标准库（`log/slog`、`archive/tar`、`compress/gzip`、`encoding/json`、`crypto/sha256`）。
 
-## 当前阶段：v0.6.0（真机验收 + 审计已完成）
+## 当前阶段：v0.8.0（容器权限隔离 + Docker 镜像转换）
+
+**v0.8.0 已完成**：外部安全审计后的权限隔离修复 + Docker 镜像转换。
+
+- **容器权限隔离（三层，详见《容器权限隔离》一节）**：v0.8.0 之前容器在 root 下
+  运行时就是**真正的宿主 root 且持有全部 capability**，容器内可直接
+  `echo b > /proc/sysrq-trigger` 重启宿主、可加载 eBPF、可改写宿主 `/proc/sys`。
+  现补齐 no_new_privs + capability 裁剪（默认集与 Docker 一致）+ seccomp 黑名单，
+  并新增 `--cap-add` / `--cap-drop`。**注意：真机尚未验证，见 [docs/unverified.md](docs/unverified.md)。**
+- **`licore convert`**：把 Docker 镜像转成 `.licore`（`docker export` 导出 rootfs +
+  `docker inspect` 重建运行配置），支持单个与批量（`--from-file` / `--jobs`）。
+  限制见 [docs/convert.md](docs/convert.md)——尤其是 `HEALTHCHECK` 会被**静默丢弃**。
+- **未验证项的统一登记处**：**[docs/unverified.md](docs/unverified.md)**。新增任何
+  "代码完成但未在真机验证"的能力，必须在那里登记，不要只在 PR 描述里提一句。
 
 阶段 0 已完成：目录骨架、`go.mod`、文档、占位包，并已发布 `v0.1.0` 被 pkg.go.dev 收录。
 阶段 1 / 阶段 2 已完成：镜像格式、运行时、boot/shim 体系、`licore run/stop/ps/rm` 端到端（见下）。
