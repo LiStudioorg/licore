@@ -446,6 +446,7 @@ func (s *Store) ReadState(name, version string) (*State, error)
 func (s *Store) ListImages() ([]ImageInfo, error)
 func (s *Store) ImageDir(name, version string) string
 func (s *Store) ImagesRoot() string
+func (s *Store) RemoveImage(name, version string, force, inUse bool) error // 新增（v0.7.4）
 
 // boot 标记
 func (s *Store) BootMarker() string
@@ -456,7 +457,7 @@ func (r Restart) Valid() bool
 func (r Restart) BootEligible() bool
 
 // 哨兵
-ErrExists, ErrContainerExists, ErrContainerNotFound, ErrBadContainerConfig
+ErrExists, ErrImageNotFound, ErrImageInUse, ErrContainerExists, ErrContainerNotFound, ErrBadContainerConfig
 ```
 
 - `ContainerConfig` 的 JSON 字段为 `run`/`boot`/`shim`/`ps` 共用契约；**新增字段必须 omitempty**，

@@ -99,3 +99,36 @@ func (s *Store) readImageInfo(name, version string) (*ImageInfo, error) {
 		LayerCount:   len(meta.Layers),
 	}, nil
 }
+
+// RemoveImage 删除本地镜像目录 <root>/images/<name>/<version>/。
+// 镜像不存在时返回 ErrImageNotFound（调用方据此给出明确提示，而不是静默成功）。
+//
+// 删除只针对该引用自己的目录：层缓存（<root>/layers/sha256/**）跨镜像共享、
+// 不随镜像删除回收，与 `licore rm` 的既有语义一致——回收共享层需要引用计数，
+// 属独立议题。
+//
+// inUse 为 true 且 force 为 false 时返回 ErrImageInUse：调用方传入"该镜像
+// 是否仍被容器引用"，避免删掉正在被容器使用的镜像。
+func (s *Store) RemoveImage(name, version string, force, inUse bool) error {
+	if name == "" || version == "" {
+		return fmt.Errorf("镜像引用 %q 非法，应为 NAME:VERSION: %w", name+":"+version, ErrImageNotFound)
+	}
+	dir := s.ImageDir(name, version)
+	if _, err := os.Stat(filepath.Join(dir, "state.json")); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("镜像 %s:%s: %w", name, version, ErrImageNotFound)
+		}
+		return fmt.Errorf("检查镜像 %s:%s 失败: %w", name, version, err)
+	}
+	if inUse && !force {
+		return fmt.Errorf("镜像 %s:%s: %w（先停止并删除使用它的容器，或用 -f 强制删除）",
+			name, version, ErrImageInUse)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("删除镜像目录 %s 失败: %w", dir, err)
+	}
+	// 顺手清理空的 name 目录，避免 `licore images` 扫描到只剩空壳的层级。
+	// 目录非空（还有其他 tag）时 Remove 会失败，属预期，忽略即可。
+	_ = os.Remove(filepath.Dir(dir))
+	return nil
+}
