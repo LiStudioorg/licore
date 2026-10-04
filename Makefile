@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 #
 # LiCore 构建入口。设计要点：
-#   - 全部目标都是纯 Go（CGO_ENABLED=0），产出静态二进制、无 glibc 依赖；
-#   - 不再需要 C 工具链 / Android NDK：v0.8.0 起 `licore exec` 改为调用系统的
+#   - 全部目标都是纯 Go（CGO_ENABLED=0），无 glibc 依赖、无需 C 工具链；
+#     注意 Linux 目标产出静态链接二进制，而 android/darwin 因平台运行时
+#     （bionic linker / Mach-O DYLDLINK）本就是动态链接，与 cgo 无关；
+#   - 不再需要 Android NDK：v0.7.5 起 `licore exec` 改为调用系统的
 #     nsenter（util-linux / Toybox / busybox 均提供），因此没有 cgo 变体；
 #   - `-tags nocgo_exec` 已废弃，保留兼容（不再有任何文件依赖该标签）；
 #   - 不隐式下载工具链：缺什么就报错，绝不静默产出坏二进制。
@@ -11,7 +13,7 @@
 BIN      := licore
 DIST     := dist
 GO       ?= go
-# 版本号：make VERSION=0.8.0 all，或直接 -ldflags 覆盖。
+# 版本号：make VERSION=0.7.6 all，或直接 -ldflags 覆盖。
 VERSION  ?= 0.0.0-dev
 LDFLAGS  := -s -w -X main.version=$(VERSION)
 

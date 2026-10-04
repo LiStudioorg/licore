@@ -36,7 +36,8 @@ Android 有 Root 走与 Linux 服务器相同的 `native_linux` 后端：namespa
 ```bash
 cd licore
 CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -o licore-android-arm64 .
-# 无需 NDK、无需 C 工具链：产物是静态链接的纯 Go 二进制，exec 能力完整。
+# 无需 NDK、无需 C 工具链：产物是纯 Go（无 cgo / glibc 依赖），exec 能力完整。
+# 注意 Android 产物本身是动态链接的（bionic 平台运行时要求），这与 cgo 无关。
 # `licore exec` 依赖设备上的 nsenter（见 3.2）。
 ```
 
@@ -109,7 +110,8 @@ adb shell su -c 'LICORE_HOME=/data/licore /data/local/bin/licore ps'
 
 ### 3.2 `licore exec` 在 Android 上依赖 nsenter
 
-二进制**始终是纯 Go**（`CGO_ENABLED=0`，静态链接、无需 NDK）。`exec` 需要进入容器的
+二进制**始终是纯 Go**（`CGO_ENABLED=0`，无 cgo / glibc 依赖、无需 NDK；Android 产物
+因 bionic 平台运行时是动态链接的，与 cgo 无关）。`exec` 需要进入容器的
 **挂载**命名空间，即 `setns(CLONE_NEWNS)`；纯 Go 无法安全调用（线程会在 syscall 间迁移，
 Go issue #9091），因此这一步交给系统的 `nsenter`：
 

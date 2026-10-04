@@ -4,9 +4,12 @@
 # LiCore 发布流程：推送任意 tag 时构建全部平台二进制、打包、生成校验和、
 # 创建 GitHub Release 并上传资产。
 #
-# 资产设计（8 个 tar.gz + SHA256SUMS）：
-#   - 每个平台一个包，**全部是纯 Go 静态二进制**（CGO_ENABLED=0）；
-#   - 不再有 -cgo 变体：v0.8.0 起 `licore exec` 改为调用系统的 nsenter
+# 资产设计（8 个 tar.gz + SHA256SUMS = 9 个资产）：
+#   - 每个平台一个包，全部是纯 Go（CGO_ENABLED=0）产物，**无 glibc / 无 cgo 依赖**；
+#     注意「纯 Go」不等于「一律静态链接」：linux/* 是静态链接，而 android/arm64
+#     与 darwin/* 因平台运行时（bionic linker / Mach-O DYLDLINK）本就是动态链接，
+#     这与 cgo 无关（v0.7.5 的 Release 就是被这个误解坑过一次，见下方构建校验注释）；
+#   - 不再有 -cgo 变体：v0.7.5 起 `licore exec` 改为调用系统的 nsenter
 #     （util-linux / Toybox / busybox 均提供），纯 Go 构建即具备完整 exec 能力，
 #     因此同一个平台只需一个包；
 #   - 每个包内含 licore 二进制 + README.md + LICENSE；

@@ -15,7 +15,7 @@
 
 ## 特性
 
-- 🪶 **极轻**：运行时内存目标 10–20 MiB，单个静态二进制；除可选的 `internal/execns`（`exec` 进入容器挂载命名空间）外全部为纯 Go。
+- 🪶 **极轻**：运行时内存目标 10–20 MiB，单个二进制；**全仓库零 CGO**（`CGO_ENABLED=0`），Linux 产物为静态链接。
 - 🧩 **自研镜像格式**：`.licore` = 分层 gzip tar + 自研 `index.json`，简单、可逐层审计。
 - 📱 **平台**：Linux 服务器、Android（有 Root）、macOS；Android 无 Root 官方不支持（见《Android 支持策略》）。
 - 🏗 **多架构**：amd64 / arm64 / 386 / riscv64 等同一条命令交叉编译。
@@ -102,7 +102,8 @@ tar -xzf licore-linux-amd64.tar.gz          # 内含 licore + README.md + LICENS
 sudo install -m 0755 licore /usr/local/bin/licore
 ```
 
-归档命名规则：`licore-<os>-<arch>.tar.gz`。全部是纯 Go 静态二进制，
+归档命名规则：`licore-<os>-<arch>.tar.gz`。全部是纯 Go（`CGO_ENABLED=0`）产物，
+无 cgo / glibc 依赖（Linux 为静态链接；Android 与 macOS 因平台运行时本就是动态链接）。
 `licore exec` 是否可用取决于运行环境有没有 `nsenter`（见下文）。
 
 ### 方式三：从源码编译
@@ -115,8 +116,10 @@ make all              # linux/amd64 + linux/arm64 + android/arm64，产物在 di
 go build -o licore .
 ```
 
-> ✅ 所有构建都是**纯 Go 静态二进制**（`CGO_ENABLED=0`），无 glibc / 动态库依赖，
+> ✅ 所有构建都是**纯 Go**（`CGO_ENABLED=0`），无 cgo / glibc 依赖，
 > 也不需要 C 工具链或 Android NDK。
+> Linux 产物为静态链接；Android 与 macOS 因各自平台运行时（bionic linker /
+> Mach-O DYLDLINK）本就是动态链接，这与 cgo 无关。
 > `licore exec` 依赖系统提供的 **`nsenter`**（util-linux、Toybox 均自带；旧版
 > Android 可装 busybox / Magisk）。详见《构建矩阵》与 [docs/android-root.md](docs/android-root.md)。
 
@@ -285,7 +288,8 @@ licore exec -e FOO=bar -w /data -u 1000 myapp /bin/env   # 环境变量 / 工作
 > 探测与命令构造）。纯 Go 无法直接 `setns(CLONE_NEWNS)`（Go issue #9091），
 > nsenter 是一个单线程、exec 前的 C 程序，正好补上这一步：
 >
-> - 二进制本身**始终是纯 Go**（`CGO_ENABLED=0`），静态链接、无 glibc 依赖。
+> - 二进制本身**始终是纯 Go**（`CGO_ENABLED=0`），无 cgo / glibc 依赖
+>   （Linux 为静态链接；Android / macOS 的动态链接来自平台运行时，与 cgo 无关）。
 > - `exec` 是否可用取决于**运行环境有没有 nsenter**，与编译方式无关：
 >   同一个二进制在装了 util-linux 的机器上可用，反之返回明确的安装提示。
 > - 探测顺序：`nsenter` → `busybox nsenter`（Magisk / 精简 Android 常见）。
@@ -342,7 +346,7 @@ licore boot disable                       # 移除系统服务
 | 卷 `:ro` 只读 | ✅ | ✅ | ✅ | — |
 | 开机自启（boot enable） | ✅ systemd | ✅ systemd（用户级视环境） | ❌ Magisk 后端未实现² | — |
 
-> 上表不再有 "`CGO_ENABLED=0` 构建" 一列：v0.8.0 起所有构建都是纯 Go，
+> 上表不再有 "`CGO_ENABLED=0` 构建" 一列：v0.7.5 起所有构建都是纯 Go，
 > 不再存在「纯 Go 就缺功能」的分别。
 
 ¹ Android 10+ 由 Toybox 自带 nsenter；更早版本可能需安装 busybox（`busybox nsenter` 后备）。
@@ -419,14 +423,14 @@ make help           # 列出全部目标
 ```
 
 产物统一落在 `dist/`，形如 `dist/licore-linux-amd64`。版本号可注入：
-`make VERSION=0.8.0 all`。
+`make VERSION=0.7.6 all`。
 
-> 所有目标都是 `CGO_ENABLED=0` 的纯 Go 静态二进制，**不需要任何 C 工具链或 NDK**。
+> 所有目标都是 `CGO_ENABLED=0` 的纯 Go 产物，**不需要任何 C 工具链或 NDK**。
 > 若系统没有 `nsenter`，装一下即可获得 `exec`：`sudo apt install util-linux`。
 
 ### 构建矩阵
 
-全部目标都是纯 Go（`CGO_ENABLED=0`）、静态链接、无交叉编译前置依赖：
+全部目标都是纯 Go（`CGO_ENABLED=0`）、无交叉编译前置依赖：
 
 | 目标平台 | 命令 | 前置依赖 | `licore exec` |
 | --- | --- | --- | --- |
@@ -501,7 +505,7 @@ LiCore 只认 `.licore`。这不是"还没做"，是设计选择（见 [docs/ima
   [docs/test-report-v0.6.0.md](docs/test-report-v0.6.0.md)），日常 `run / ps / exec / 卷 / 资源限制`
   是能跑通的。
 - ⚠️ **Android 真机、macOS、多主机网络、大规模并发都未验证**（见下节）。
-- ⚠️ 项目**尚未发布 1.0**，接口与行为仍可能变化；层缓存不做引用计数回收；`exec` 需要 cgo 构建。
+- ⚠️ 项目**尚未发布 1.0**，接口与行为仍可能变化；层缓存不做引用计数回收；`exec` 需要运行环境有 `nsenter`。
 - ⚠️ 目前**没有真实用户群**，出问题时你基本得自己读源码。
 
 **建议**：适合在个人服务器、实验环境、CI 里试；把重要业务压上去之前，请先自己按
@@ -526,12 +530,13 @@ LiCore 只认 `.licore`。这不是"还没做"，是设计选择（见 [docs/ima
 | Linux 服务器（root）全功能验收 | **A–J：PASS=10 / SKIP=1 / FAIL=0** | [docs/test-report-v0.6.0.md](docs/test-report-v0.6.0.md) |
 | 每容器内存成本 | 100 容器并发实测系统增量 **227 MiB**，摊薄 **≈ 2.3 MiB/容器**，退出后完全回收 | [docs/runtime-benchmark.md](docs/runtime-benchmark.md) |
 | 100 容器并发启动 | 共享同一 rootfs 并发启动 **0 失败** | 同上 |
-| 多平台交叉编译 | CI 每次推送都跑：**8 个目标平台**（linux amd64/arm64/arm/386/riscv64、android arm64、darwin amd64/arm64）+ android/linux 两个 cgo 构建，全部通过 | GitHub Actions |
+| 多平台交叉编译 | CI 每次推送都跑：**8 个目标平台**（linux amd64/arm64/arm/386/riscv64、android arm64、darwin amd64/arm64），全部通过 | GitHub Actions |
 | 静态 / 安全 / 覆盖审计 | 见各版本审计报告 | [docs/audit-v0.6.0.md](docs/audit-v0.6.0.md) 等 |
 | 发布流程本身 | v0.7.1 真实发布：**11 个归档 + SHA256SUMS** 全部上传，下载后 `sha256sum -c` 校验通过 | [Releases](https://github.com/LiStudioorg/licore/releases) |
 
-> 说明：CI 共 11 个 job（8 个交叉编译 + 格式与测试 + 2 个 cgo）。**"8 个平台"指 GOOS/GOARCH
-> 组合数**；加上 linux/amd64、linux/arm64、android/arm64 的 cgo 变体，发布时产出 **11 个归档**。
+> 说明：上表的发布数字是 v0.7.1 当时的情况（8 个纯 Go 归档 + 3 个 cgo 变体 = 11）。
+> **v0.7.5 起 cgo 变体已全部移除**，同一平台只出一个包，发布产出变为
+> **8 个归档 + SHA256SUMS = 9 个资产**；CI 也不再有任何 cgo 构建 job。
 
 > **那一项 SKIP 是什么**：`-p` 端口映射的宿主外部可达性。验收主机为 rootless-docker +
 > ufw FORWARD DROP 环境，Docker 自身的端口映射同样不通（作对照），因此改在标准 root 主机

@@ -249,7 +249,7 @@ LiCore 的解法：把「进入命名空间」这一步交给系统的 **`nsente
 
 ### 为什么是外部程序而不是 cgo
 
-v0.7.x 及以前用自研 cgo 组件 fork 单线程子进程来完成 setns。v0.8.0 起改为
+v0.7.x 及以前用自研 cgo 组件 fork 单线程子进程来完成 setns。v0.7.5 起改为
 调用 `nsenter`，原因：
 
 - **二进制保持纯 Go**：`CGO_ENABLED=0` 即可完整构建，静态链接、无 glibc 依赖，
@@ -322,7 +322,7 @@ CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o licore-darwin-arm64 .
 - **cgroup 限额真正生效**：cgroups v2 下 `cgroup.subtree_control` 未开启 `cpu memory pids`
   时子组限额文件不可写、写入被静默忽略；现由 `internal/resource` 在 `Setup` 前显式开启控制器。
 - **`licore exec` 真正进入全部命名空间**：纯 Go 无法 `setns(CLONE_NEWNS)`（Go issue #9091），
-  改由 `internal/execns` 完成（当时是 cgo 组件，v0.8.0 起改为调用系统 `nsenter`，见下）。
+  改由 `internal/execns` 完成（当时是 cgo 组件，v0.7.5 起改为调用系统 `nsenter`，见下）。
 - **卷 `:ro` 真正只读**：bind 挂载后补 `MS_REMOUNT|MS_BIND|MS_RDONLY`，否则 `:ro` 形同虚设。
 - **同名容器并发创建原子化**：名字唯一性从"扫描后创建"（TOCTOU）改为 `O_EXCL` 锁文件；
   `rm` 改走 `RemoveContainer`，避免绕过锁释放导致名字永久泄漏。

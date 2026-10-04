@@ -39,25 +39,26 @@ go test ./... -count=1
 
 ## 2. 交叉编译
 
-发布的代码必须能在声明的全部目标平台编译通过。**纯 Go 目标**（含 Android 无 cgo）：
+发布的代码必须能在声明的全部目标平台编译通过。v0.7.5 起全仓库零 CGO，
+因此**只有这一组纯 Go 目标**（不再有 cgo 变体、也不再用 `-tags nocgo_exec`）：
 
 ```bash
 for t in "linux amd64" "linux arm64" "linux arm" "linux 386" "linux riscv64" \
          "android arm64" "darwin arm64" "darwin amd64"; do
   set -- $t
-  CGO_ENABLED=0 GOOS=$1 GOARCH=$2 go build -tags nocgo_exec -o /tmp/rel-$1-$2 . \
+  CGO_ENABLED=0 GOOS=$1 GOARCH=$2 go build -o /tmp/rel-$1-$2 . \
     && echo "OK   $1/$2" || echo "FAIL $1/$2"
 done
 ```
 
-**cgo 目标**（本机 linux/amd64，用于验证 `internal/execns`）：
-
-```bash
-CGO_ENABLED=1 go build -o /tmp/rel-cgo .
-```
-
 - [ ] 上面每个平台都输出 `OK`
-- [ ] cgo 构建成功
+
+> **关于静态链接**：`CGO_ENABLED=0` 保证「无 cgo / 无 glibc 依赖」，但**不等于
+> 一律静态链接**——linux/* 是静态的，而 android/arm64 与 darwin/* 因平台运行时
+> （bionic linker / Mach-O DYLDLINK）本就是动态链接。校验时**不要用 `ldd`**
+> （对异构 ELF 会谎报），用 `file` 与 `go version -m` 判断，判据见
+> [.github/workflows/release.yml](.github/workflows/release.yml) 的构建步骤。
+> v0.7.5 首次 Release 就是被这个误解 + `ldd` 判据坑掉的。
 
 > **为什么必须每个平台都编**：只在 linux 上验证会漏掉平台专属符号的缺失。
 > v0.7.0 开发期间就发生过一次：`internal/cli/platform.go`（无 build tag）引用了
@@ -73,7 +74,7 @@ make clean && make all && make test && make vet && make fmt && make clean
 - [ ] `make all` 产出 `dist/licore-linux-amd64`、`dist/licore-linux-arm64`、
       `dist/licore-android-arm64`
 - [ ] `make test` / `make vet` / `make fmt` 全过
-- [ ] 无 NDK 环境下 `make android` 会**明确警告并降级**为纯 Go（不是静默失败）
+- [ ] `make android` 无需 NDK 即可成功（v0.7.5 起无 cgo 变体，不存在降级分支）
 - [ ] `make clean` 后 `dist/` 已删除
 
 ## 4. 真机验证（特权路径，有 root 服务器时）
