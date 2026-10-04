@@ -499,6 +499,14 @@ LiCore 只认 `.licore`。这不是"还没做"，是设计选择（见 [docs/ima
 
 > 项目原名 Boxli，自 v0.7.0 起更名为 LiCore。历史 tag（v0.1.0 ~ v0.6.1）保留可用。
 
+## 支持这个项目
+
+LiCore 是个人项目，无商业支持。如果它帮到了你，可以请我喝杯咖啡：
+
+![微信收款码](docs/wechat-pay.png)
+
+是否支持完全自愿，不影响项目走向。
+
 ## 开源协议
 
 AGPL-3.0-only，详见 [LICENSE](LICENSE)。
