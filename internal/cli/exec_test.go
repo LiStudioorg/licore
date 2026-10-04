@@ -41,7 +41,11 @@ func TestExecCommandNotRunning(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cdir, "runtime.json"), []byte(rt), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	root.SetArgs([]string{"exec", "abc123def456", "/bin/echo", "hi", "--data-dir", dir})
+	// --data-dir 是 exec **自己的** flag，必须写在容器名之前：
+	// 容器名之后的参数一律原样作为容器内命令（与 run / Docker 一致）。
+	// 这条曾依赖旧的"交错解析"行为（flag 可写在任意位置），修复后被正确地
+	// 当成容器命令了——所以这里把 flag 挪到前面。
+	root.SetArgs([]string{"exec", "--data-dir", dir, "abc123def456", "/bin/echo", "hi"})
 	err := root.Execute()
 	if err == nil || !strings.Contains(err.Error(), "未在运行") {
 		t.Fatalf("未运行容器应报错: %v", err)

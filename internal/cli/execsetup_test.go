@@ -89,3 +89,59 @@ func TestExecSetupCommandParsesArgs(t *testing.T) {
 		t.Error("缺少命令时应报错")
 	}
 }
+
+// TestExecCommandPassesFlagsAfterContainerName 回归：容器名之后的参数
+// 必须原样作为容器内命令，不被解析为 licore 的 flag。
+//
+// 历史缺陷：exec 缺少 SetInterspersed(false)，于是
+//
+//	licore exec captest /bin/sh -c "echo hi"
+//
+// 报 `unknown shorthand flag: 'c' in -c`，用户被迫加 `--`。
+// run 命令一直有这一行，exec 从来没有——所以这条用例也钉住"两个命令行为一致"。
+func TestExecCommandPassesFlagsAfterContainerName(t *testing.T) {
+	cmd := newExecCommand(&strings.Builder{})
+	// 容器名（这里必然不存在）之后的 -c 不该被 cobra 吃掉；
+	// 若被吃掉，错误会是 "unknown shorthand flag"，而不是"容器不存在"。
+	cmd.SetArgs([]string{"no-such-container", "/bin/sh", "-c", "echo hi"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("容器不存在时应报错")
+	}
+	if strings.Contains(err.Error(), "unknown shorthand flag") {
+		t.Errorf("容器名之后的 -c 被当成 licore 的 flag 解析了: %v", err)
+	}
+	if !strings.Contains(err.Error(), "容器不存在") {
+		t.Errorf("期望解析通过、进到查找容器，实际错误: %v", err)
+	}
+}
+
+// TestExecCommandFlagsBeforeContainerNameStillWork 确认修复没有把
+// exec 自己的 flag 也一起禁掉（flag 必须写在容器名**之前**）。
+func TestExecCommandFlagsBeforeContainerNameStillWork(t *testing.T) {
+	cmd := newExecCommand(&strings.Builder{})
+	cmd.SetArgs([]string{"-i", "no-such-container", "/bin/sh"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("容器不存在时应报错")
+	}
+	if strings.Contains(err.Error(), "unknown shorthand flag") {
+		t.Errorf("容器名之前的 -i 应被正常识别: %v", err)
+	}
+	if !strings.Contains(err.Error(), "容器不存在") {
+		t.Errorf("-i 应被识别后进到查找容器: %v", err)
+	}
+}
+
+// TestExecCommandDoubleDashStillWorks 确认 `--` 写法保持兼容（不因修复而回归）。
+func TestExecCommandDoubleDashStillWorks(t *testing.T) {
+	cmd := newExecCommand(&strings.Builder{})
+	cmd.SetArgs([]string{"no-such-container", "--", "/bin/sh", "-c", "echo hi"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("容器不存在时应报错")
+	}
+	if strings.Contains(err.Error(), "unknown shorthand flag") {
+		t.Errorf("`--` 写法应被正确处理: %v", err)
+	}
+}

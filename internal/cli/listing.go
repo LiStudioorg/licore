@@ -101,5 +101,13 @@ func newExecCommand(out io.Writer) *cobra.Command {
 		"在容器已有能力基础上进一步收紧（可重复）；exec **只允许收紧**")
 	cmd.Flags().StringSliceVar(&opts.capAdd, "cap-add", nil,
 		"（已禁用）exec 不允许放宽能力；该参数会被明确拒绝")
+	// 容器名之后的参数一律原样作为容器内命令，不再解析为 licore 的 flag。
+	//
+	// 与 run 的 SetInterspersed(false) 同一理由：`licore exec c /bin/sh -c "..."`
+	// 里的 -c 是**容器内命令**的选项，不该被 cobra 当成自己的。不加这一行时
+	// 会报 `unknown shorthand flag: 'c' in -c`，用户只能被迫加 `--`。
+	//
+	// 代价与 Docker 一致：exec 自己的 flag 必须写在容器名之前。
+	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
