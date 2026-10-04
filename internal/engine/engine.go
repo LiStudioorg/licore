@@ -65,6 +65,10 @@ type RunSpec struct {
 	PidsLimit int
 	// Limits 是完整的资源限制（CLI 由 runLimits 装配）；空表示无显式限制。
 	Limits *resource.Limits
+	// CapDrop / CapAdd 是能力裁剪规格（--cap-drop / --cap-add）。
+	// 空表示用运行时内置的 Docker 默认集。
+	CapDrop []string
+	CapAdd  []string
 }
 
 // RunResult 是一次 run 的结果。
@@ -159,6 +163,8 @@ func Run(ctx context.Context, st *store.Store, spec *RunSpec) (*RunResult, error
 		WorkingDir:    workdir,
 		User:          user,
 		Network:       spec.Network,
+		CapDrop:       spec.CapDrop,
+		CapAdd:        spec.CapAdd,
 		CreatedAt:     time.Now().UTC().Format(time.RFC3339),
 	}
 	if err := st.CreateContainer(cfg); err != nil {
@@ -294,6 +300,9 @@ func runForeground(ctx context.Context, st *store.Store, cfg *store.ContainerCon
 	env = append(env, netEnvFor(st, cfg, cfg.Hostname)...)
 	env = append(env, runtime.MountEnv(cfg.Mounts)...)
 	env = append(env, runtime.CgroupEnv(cfg.ID)...)
+	// 能力裁剪规格同样经环境变量下发：init 在 execve 前读取并应用。
+	// 空值表示走运行时内置的 Docker 默认集。
+	env = append(env, runtime.CapsEnv(cfg.CapDrop, cfg.CapAdd)...)
 	r, err := runtime.StartWith(&runtime.Config{
 		Rootfs:   cfg.Rootfs,
 		Hostname: cfg.Hostname,

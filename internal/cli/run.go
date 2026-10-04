@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -16,6 +17,7 @@ import (
 	"github.com/LiStudioorg/licore/internal/engine"
 	"github.com/LiStudioorg/licore/internal/network"
 	"github.com/LiStudioorg/licore/internal/resource"
+	"github.com/LiStudioorg/licore/internal/runtime"
 	"github.com/LiStudioorg/licore/internal/store"
 )
 
@@ -47,6 +49,8 @@ func newRunCommand(out io.Writer) *cobra.Command {
 		network      string
 		ip           string
 		dataDir      string
+		capAdd       []string
+		capDrop      []string
 	}
 	cmd := &cobra.Command{
 		Use:   "run [flags] <image> [command...]",
@@ -66,6 +70,10 @@ func newRunCommand(out io.Writer) *cobra.Command {
 				return err
 			}
 			if _, err := parseMounts(opts.volumes); err != nil {
+				return err
+			}
+			// 提前校验能力名：拼错时立刻报错，而不是等容器启动到 exec 前才失败。
+			if err := validateCapSpecs(opts.capDrop, opts.capAdd); err != nil {
 				return err
 			}
 			lims, err := runLimits(opts.memoryMB, opts.memorySwapMB, opts.memoryResMB, opts.cpus, opts.pidsLimit, opts.cpuset, opts.blkioWeight, opts.storageMB, opts.networkBw, opts.gpu, opts.npu)
@@ -96,6 +104,8 @@ func newRunCommand(out io.Writer) *cobra.Command {
 				CPUs:       opts.cpus,
 				PidsLimit:  opts.pidsLimit,
 				Limits:     lims,
+				CapDrop:    opts.capDrop,
+				CapAdd:     opts.capAdd,
 			}
 
 			// 前台模式：Ctrl+C（SIGINT/SIGTERM）→ ctx 取消 → engine 转发容器。
@@ -168,7 +178,33 @@ func newRunCommand(out io.Writer) *cobra.Command {
 	f.StringVar(&opts.network, "network", "licore0", "接入网络：licore0(bridge)|host|none|自定义")
 	f.StringVar(&opts.ip, "ip", "", "指定容器 IP（默认自动分配）")
 	f.StringVar(&opts.dataDir, "data-dir", "", "数据目录（默认 $LICORE_HOME 或 ~/.licore）")
+	f.StringSliceVar(&opts.capDrop, "cap-drop", nil,
+		"从默认能力集移除能力（可重复）；--cap-drop ALL 清空，只留 --cap-add 显式指定的")
+	f.StringSliceVar(&opts.capAdd, "cap-add", nil,
+		"在默认能力集之上追加能力（可重复），如 --cap-add SYS_ADMIN")
 	return cmd
+}
+
+// validateCapSpecs 在启动前校验 --cap-add / --cap-drop 的名字。
+//
+// 提前失败的理由：能力名写错如果拖到容器 init 的 exec 前才报错，用户看到的
+// 是一个已经建好 rootfs、联网、占了名字的容器却启动失败，排查成本高得多。
+func validateCapSpecs(drop, add []string) error {
+	for _, spec := range [][]string{drop, add} {
+		for _, s := range spec {
+			if strings.TrimSpace(s) == "" {
+				return fmt.Errorf("run: --cap-drop/--cap-add 里有空的能力名")
+			}
+			if _, err := runtime.ParseCapability(s); err != nil {
+				// ALL 是集合关键字，parse 会拒绝；这里放行。
+				if strings.EqualFold(strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(s)), "CAP_"), "ALL") {
+					continue
+				}
+				return fmt.Errorf("run: %w", err)
+			}
+		}
+	}
+	return nil
 }
 
 // parsePorts 把 -p 的字符串解析为 PortMapping 列表。

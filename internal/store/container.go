@@ -87,6 +87,11 @@ type ContainerConfig struct {
 	IP string `json:"ip,omitempty"`
 	// Mounts 是已解析的卷挂载列表（源路径就绪，运行时挂载）。
 	Mounts []Mount `json:"mounts,omitempty"`
+	// CapDrop 是从默认能力集里移除的能力（--cap-drop，可含 ALL）。
+	// 新增字段一律 omitempty：旧版本读新配置不得失败。
+	CapDrop []string `json:"capDrop,omitempty"`
+	// CapAdd 是在默认能力集之上追加的能力（--cap-add）。
+	CapAdd []string `json:"capAdd,omitempty"`
 	// CreatedAt 是创建时间（UTC，RFC 3339）。
 	CreatedAt string `json:"createdAt"`
 }

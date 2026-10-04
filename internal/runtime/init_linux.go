@@ -365,7 +365,15 @@ func executeContainerCmd(cmdline, env []string) error {
 	if err := setNoNewPrivs(); err != nil {
 		return err
 	}
-	// 2. SELinux 的 attr/exec 只对本进程的**下一次** execve 生效，必须紧邻 execve。
+	// 2. 能力裁剪：先清边界集再 capset。**这一步才是真正挡住危险操作的**
+	//    （写 /proc/sysrq-trigger、加载 eBPF 都需要 CAP_SYS_ADMIN）；
+	//    no_new_privs 本身不丢能力，两者是互补关系。
+	kept, err := applyCapabilitiesFromEnv()
+	if err != nil {
+		return fmt.Errorf("裁剪容器能力失败: %w", err)
+	}
+	slog.Debug("容器能力已裁剪", slog.Any("kept", kept))
+	// 3. SELinux 的 attr/exec 只对本进程的**下一次** execve 生效，必须紧邻 execve。
 	inheritSELinuxContext()
 	if err := syscall.Exec(cmdline[0], cmdline, env); err != nil {
 		return fmt.Errorf("exec %s: %w", cmdline[0], err)
