@@ -373,7 +373,14 @@ func executeContainerCmd(cmdline, env []string) error {
 		return fmt.Errorf("裁剪容器能力失败: %w", err)
 	}
 	slog.Debug("容器能力已裁剪", slog.Any("kept", kept))
-	// 3. SELinux 的 attr/exec 只对本进程的**下一次** execve 生效，必须紧邻 execve。
+	// 3. seccomp 黑名单：在能力裁剪之后再装。安装过滤器需要 no_new_privs
+	//    （第 1 步已设）或 CAP_SYS_ADMIN，因此即便此时 CAP_SYS_ADMIN 已丢，
+	//    本调用依然成立。它是纵深防御的第二层——万一某个能力被放回来，
+	//    危险调用仍会被 EPERM 挡住。
+	if err := installSeccompFilter(); err != nil {
+		return fmt.Errorf("安装 seccomp 过滤器失败: %w", err)
+	}
+	// 4. SELinux 的 attr/exec 只对本进程的**下一次** execve 生效，必须紧邻 execve。
 	inheritSELinuxContext()
 	if err := syscall.Exec(cmdline[0], cmdline, env); err != nil {
 		return fmt.Errorf("exec %s: %w", cmdline[0], err)
