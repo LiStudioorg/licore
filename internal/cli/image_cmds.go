@@ -83,29 +83,68 @@ func newCommitCommand(out io.Writer) *cobra.Command {
 	return cmd
 }
 
-// newSaveCommand 实现 `licore save IMAGE -o out.licore`。
+// newSaveCommand 实现 `licore save IMAGE [OUT]` / `licore save IMAGE -o OUT`。
+//
+// 输出路径两种写法都支持：位置参数（`save alpine:3.20 out.licore`，与
+// `licore export` 对称）和 -o/--output（脚本里更显式）。两者同时给且不一致
+// 时报错，避免"到底写去了哪"靠猜。
 func newSaveCommand(out io.Writer) *cobra.Command {
 	var root, dst string
 	cmd := &cobra.Command{
-		Use:   "save IMAGE",
+		Use:   "save IMAGE [OUT]",
 		Short: "把本地镜像保存为 .licore 文件",
-		Args:  cobra.ExactArgs(1),
+		Long: "把本地镜像保存为 .licore 文件。\n" +
+			"输出路径可以写成位置参数，也可以用 -o/--output；两者同时给出时必须一致。",
+		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			target, err := resolveOutputArg(args, dst, "save")
+			if err != nil {
+				return err
+			}
 			st, err := store.Open(root)
 			if err != nil {
 				return err
 			}
-			if err := SaveImage(st, args[0], dst, true); err != nil {
+			if err := SaveImage(st, args[0], target, true); err != nil {
 				return err
 			}
-			fmt.Fprintln(out, dst)
+			fmt.Fprintln(out, target)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&root, "data-dir", "", "数据目录")
-	cmd.Flags().StringVarP(&dst, "output", "o", "", "输出 .licore 文件（必填）")
-	cmd.MarkFlagRequired("output")
+	cmd.Flags().StringVarP(&dst, "output", "o", "", "输出 .licore 文件（也可写成位置参数）")
 	return cmd
+}
+
+// resolveOutputArg 统一"位置参数 vs -o/--output"两种输出路径写法。
+//
+//	name   命令名，用于错误信息
+//	args   cobra 收到的位置参数（args[1] 若存在即为输出路径）
+//	flag  -o/--output 的值
+//
+// 两者都给时逐个比较原始值：故意不做 filepath.Clean 归一化——写出的就是用户
+// 字面给的路径，若字面不同却"清理后相同"，说明用户自己也不确定，报错更安全。
+func resolveOutputArg(args []string, flag, name string) (string, error) {
+	var positional string
+	if len(args) > 1 {
+		positional = args[1]
+	}
+	switch {
+	case positional != "" && flag != "":
+		if positional != flag {
+			return "", fmt.Errorf("%s: 输出路径冲突：位置参数 %q 与 --output %q 不一致",
+				name, positional, flag)
+		}
+		return positional, nil
+	case positional != "":
+		return positional, nil
+	case flag != "":
+		return flag, nil
+	default:
+		return "", fmt.Errorf("%s: 必须指定输出文件：%s IMAGE <OUT> 或 %s IMAGE -o <OUT>",
+			name, name, name)
+	}
 }
 
 // newLoadCommand 实现 `licore load -i file.licore`。
@@ -134,28 +173,34 @@ func newLoadCommand(out io.Writer) *cobra.Command {
 	return cmd
 }
 
-// newExportCommand 实现 `licore export IMAGE -o out.licore`（与 save 等价，方向同源）。
+// newExportCommand 实现 `licore export IMAGE [OUT]`（与 save 等价，方向同源）。
+// 输出路径写法与 save 完全一致（位置参数或 -o），两者是同一套语法。
 func newExportCommand(out io.Writer) *cobra.Command {
 	var root, dst string
 	cmd := &cobra.Command{
-		Use:   "export IMAGE",
+		Use:   "export IMAGE [OUT]",
 		Short: "导出本地镜像为 .licore 文件",
-		Args:  cobra.ExactArgs(1),
+		Long: "导出本地镜像为 .licore 文件（与 save 等价）。\n" +
+			"输出路径可以写成位置参数，也可以用 -o/--output；两者同时给出时必须一致。",
+		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			target, err := resolveOutputArg(args, dst, "export")
+			if err != nil {
+				return err
+			}
 			st, err := store.Open(root)
 			if err != nil {
 				return err
 			}
-			if err := ExportImage(st, args[0], dst, true); err != nil {
+			if err := ExportImage(st, args[0], target, true); err != nil {
 				return err
 			}
-			fmt.Fprintln(out, dst)
+			fmt.Fprintln(out, target)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&root, "data-dir", "", "数据目录")
-	cmd.Flags().StringVarP(&dst, "output", "o", "", "导出文件（必填）")
-	cmd.MarkFlagRequired("output")
+	cmd.Flags().StringVarP(&dst, "output", "o", "", "导出文件（也可写成位置参数）")
 	return cmd
 }
 
