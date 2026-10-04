@@ -29,6 +29,30 @@ const (
 	oldRootPrefix = ".licore_old_root."
 )
 
+// prSetNoNewPrivs 是 prctl(2) 的 PR_SET_NO_NEW_PRIVS 选项号（linux/prctl.h）。
+//
+// 标准库 syscall 既没有 Prctl 包装、也没有这个常量，因此自己定义；
+// 调用走 syscall.Syscall(syscall.SYS_PRCTL, ...)，SYS_PRCTL 由标准库按架构给出。
+const prSetNoNewPrivs = 38
+
+// setNoNewPrivs 设置 PR_SET_NO_NEW_PRIVS，阻止本进程及其后代通过 execve
+// 获得新特权（setuid/setgid 二进制、file capabilities 提权）。
+//
+// 语义要点：
+//   - 该标志**单向不可逆**（设上之后无法清除），且随 fork/exec 继承；
+//   - 它**不丢弃 capability**——一个持有全部能力的 root 进程设了它之后
+//     依然能做特权操作。它挡的是"通过 execve 提权"这一类，以及作为
+//     安装 seccomp 过滤器（SECCOMP_MODE_FILTER）的前置条件；
+//   - 因为不可逆，测试必须在子进程里跑，否则会污染整个测试进程。
+func setNoNewPrivs() error {
+	// prctl 有 5 个参数，但后两个为 0；syscall.Syscall 只传 3 个足够。
+	_, _, errno := syscall.Syscall(syscall.SYS_PRCTL, uintptr(prSetNoNewPrivs), 1, 0)
+	if errno != 0 {
+		return fmt.Errorf("prctl(PR_SET_NO_NEW_PRIVS): %w", errno)
+	}
+	return nil
+}
+
 // 挂载常量补充（syscall 包未导出 MS_NOSUID / MS_NOEXEC / MS_NODEV）。
 const (
 	msNoSuid  = 0x2   // MS_NOSUID
@@ -324,9 +348,24 @@ func inheritSELinuxContext() string {
 	return ctx
 }
 
-// executeContainerCmd 是容器 init 的最后一步：设置 SELinux exec 上下文后
-// execve 用户命令。抽成独立函数以便单元测试覆盖上下文处理路径。
+// executeContainerCmd 是容器 init 的最后一步：收紧权限（no_new_privs +
+// capability 裁剪）后设置 SELinux exec 上下文，再 execve 用户命令。
+// 抽成独立函数以便单元测试覆盖上下文处理路径。
+//
+// **顺序在这里是安全属性的一部分**，不能随意调整：
+//  1. 权限收紧必须在所有特权准备（mount / pivot_root / 建网卡 / SELinux
+//     写 attr/exec 之前的网络配置）**之后**——那些操作需要完整能力，
+//     提前丢能力会让容器直接启动失败；
+//  2. 又必须在 execve **之前**——否则用户命令会带着完整能力跑起来。
+//
+// 因此这里是唯一正确的收口位置：init 干完所有需要特权的事，在交出控制权
+// 的最后一刻把权限降下来。
 func executeContainerCmd(cmdline, env []string) error {
+	// 1. no_new_privs：阻止 execve 获得新特权，同时是安装 seccomp 过滤器的前置条件。
+	if err := setNoNewPrivs(); err != nil {
+		return err
+	}
+	// 2. SELinux 的 attr/exec 只对本进程的**下一次** execve 生效，必须紧邻 execve。
 	inheritSELinuxContext()
 	if err := syscall.Exec(cmdline[0], cmdline, env); err != nil {
 		return fmt.Errorf("exec %s: %w", cmdline[0], err)
