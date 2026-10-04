@@ -130,10 +130,19 @@ jobs:
         run: |
           CGO_ENABLED=0 go build -o /tmp/licore .
           file /tmp/licore
-          if ldd /tmp/licore 2>&1 | grep -q "not a dynamic executable"; then
-            echo "OK：静态链接，无动态依赖"
-          else
-            echo "FAIL：二进制不是静态链接，仍依赖动态库" >&2
-            ldd /tmp/licore
-            exit 1
-          fi
+          # 判据用 file 而非 ldd：ldd 对异构 ELF 会谎报
+          # "not a dynamic executable"，且在静态二进制上退出码不统一，
+          # 容易把好产物判死（release.yml 首跑即栽在这上面）。
+          desc="$(file -b /tmp/licore)"
+          case "$desc" in
+            *"statically linked"*|*"static-pie linked"*)
+              echo "OK：静态链接，无动态依赖" ;;
+            *)
+              echo "FAIL：二进制不是静态链接，仍依赖动态库" >&2
+              echo "     $desc" >&2
+              exit 1 ;;
+          esac
+          # Go 内嵌的构建设置是最终裁决：必须明确标记 CGO_ENABLED=0。
+          go version -m /tmp/licore | grep -q "CGO_ENABLED=0" \
+            || { echo "FAIL：构建元数据未标记 CGO_ENABLED=0" >&2; exit 1; }
+          echo "OK：构建元数据 CGO_ENABLED=0"

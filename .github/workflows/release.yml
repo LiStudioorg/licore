@@ -99,16 +99,60 @@ jobs:
           echo "构建产物："
           ls -la "$OUT"
 
-          # 全部产物必须是静态链接——这是去掉 cgo 的核心收益，不能回退。
+          # 校验「零 cgo / 零 libc 依赖」——这是去掉 cgo 的核心收益，不能回退。
+          #
+          # 判据是 **file 报告里不得出现 libc/cgo 痕迹**，而不是「必须 static」：
+          #   - linux/*：CGO_ENABLED=0 的纯 Go 链接器产出 static-pie/static，
+          #     应明确报 statically linked；
+          #   - android/arm64：bionic 平台**总是**动态链接（interpreter
+          #     /system/bin/linker64），与 cgo 无关，静态反而是错的；
+          #   - darwin/*：Mach-O 恒带 DYLDLINK，同理。
+          # 因此对后两者不能要求 static，只要求「不依赖 glibc」。
+          #
+          # 另外 `ldd` 在此不可用作判据：在异构 ELF 上它会谎报
+          # "not a dynamic executable"（实测对 android/darwin 产物均误报），
+          # v0.7.5 首跑就是被这个假阳性/假阴性坑掉的。`file` 只读头部，稳定。
           for bin in "$OUT"/licore-*; do
-            if ldd "$bin" 2>&1 | grep -q "not a dynamic executable"; then
-              echo "OK  $(basename "$bin") 静态链接"
-            else
-              echo "FAIL $(basename "$bin") 仍有动态依赖：" >&2
-              ldd "$bin" >&2
+            name="$(basename "$bin")"
+            desc="$(file -b "$bin")"
+            case "$name" in
+              licore-linux-*)
+                case "$desc" in
+                  *"statically linked"*|*"static-pie linked"*)
+                    echo "OK   $name 静态链接（无 libc 依赖）" ;;
+                  *)
+                    echo "FAIL $name 不是静态链接，去 cgo 的收益回退了：" >&2
+                    echo "     $desc" >&2
+                    exit 1 ;;
+                esac
+                ;;
+              *)
+                # Android / macOS：平台运行时本就动态，只禁止 glibc 依赖。
+                if echo "$desc" | grep -qiE "glibc|GNU/Linux"; then
+                  echo "FAIL $name 报告了 glibc 依赖：" >&2
+                  echo "     $desc" >&2
+                  exit 1
+                fi
+                echo "OK   $name 动态链接属平台预期（$(echo "$desc" | cut -d, -f2 | sed 's/^ //')），无 glibc 依赖"
+                ;;
+            esac
+          done
+
+          # 补充一道与架构无关的硬证据：Go 在二进制里内嵌了构建设置，
+          # 直接读它确认每个产物都是 CGO_ENABLED=0 编出来的。
+          #
+          # 不用 `strings | grep runtime/cgo`：那会误报——Go runtime 的源码路径
+          # 字符串（如 /usr/local/go/src/runtime/cgocall.go）在**静态**产物里
+          # 同样存在，与被链接进 cgo 是两回事。实测 linux/amd64 静态产物也有这
+          # 三条字符串，按那个判据会把好的产物判死。
+          for bin in "$OUT"/licore-*; do
+            if ! go version -m "$bin" 2>/dev/null | grep -q "CGO_ENABLED=0"; then
+              echo "FAIL $(basename "$bin") 未标记 CGO_ENABLED=0，可能混入了 cgo 构建" >&2
+              go version -m "$bin" 2>&1 | grep -E "CGO_ENABLED|GOOS|GOARCH" >&2 || true
               exit 1
             fi
           done
+          echo "OK   全部产物的构建设置均为 CGO_ENABLED=0"
 
       - name: 打包（tar.gz，含 README 与 LICENSE）
         run: |
