@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -324,4 +325,134 @@ func TestSafeArchivePath(t *testing.T) {
 			t.Errorf("SafeArchivePath(%q) err = %v, want ErrUnsafePath", bad, err)
 		}
 	}
+}
+
+// buildLiCoreWithDirs 写一个含目录条目的 .licore 外层归档，模拟
+// `tar -cf x.licore layers/ blobs/ index.json` 这类手工打包产物：
+// GNU tar 会为每个命令行上的目录写入带尾斜杠的目录条目。
+func buildLiCoreWithDirs(t *testing.T, dir, name string, dirs []string, entries map[string][]byte) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tw := tar.NewWriter(f)
+	for _, d := range dirs {
+		// tar.TypeDir 的 Name 以 "/" 结尾正是 GNU tar 的实际写法，
+		// 也是本次修复前被判为"空路径段"的形态。
+		hdr := &tar.Header{Name: d, Mode: 0o755, Typeflag: tar.TypeDir}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 条目顺序固定，避免 map 迭代顺序影响可复现性。
+	names := make([]string, 0, len(entries))
+	for ename := range entries {
+		names = append(names, ename)
+	}
+	sort.Strings(names)
+	for _, ename := range names {
+		data := entries[ename]
+		hdr := &tar.Header{Name: ename, Mode: 0o644, Size: int64(len(data)), Typeflag: tar.TypeReg}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// licoreEntries 返回一份合法的 .licore 条目集合 + 目录条目列表。
+func licoreEntries(t *testing.T) (map[string][]byte, []string) {
+	t.Helper()
+	layerData, layerDigest := buildLayer(t, map[string]string{"etc/hello": "hi"})
+	cfg := buildConfig(t)
+	layers := []Layer{{Path: "layers/000001.base.tar.gz", Digest: layerDigest, SizeBytes: int64(len(layerData)), ApplyOrder: 1}}
+	idx := manifestBuilder(t, layers, cfg)
+	algo, hx, _ := strings.Cut(digestOf(cfg), ":")
+	return map[string][]byte{
+		IndexName:                   idx,
+		"layers/000001.base.tar.gz": layerData,
+		BlobsDir + algo + "-" + hx:  cfg,
+	}, []string{"layers", "blobs"}
+}
+
+// TestOpenFileSkipsDirectoryEntries 覆盖手工 tar 打包场景：目录条目
+// （`layers/`、`./` 等含尾斜杠形态）必须被跳过而非判为不安全。
+func TestOpenFileSkipsDirectoryEntries(t *testing.T) {
+	cases := []struct {
+		name string
+		dirs []string
+	}{
+		{"尾斜杠目录条目", []string{"layers/", "blobs/"}},
+		{"点前缀目录条目", []string{"./layers/", "./blobs/"}},
+		{"裸点目录条目", []string{"./", "layers/", "blobs/"}},
+		{"带子目录的目录条目", []string{"layers/", "layers/sub/", "blobs/"}},
+		{"无目录条目（回归）", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entries, _ := licoreEntries(t)
+			path := buildLiCoreWithDirs(t, t.TempDir(), "t.licore", tc.dirs, entries)
+			loaded, err := OpenFile(path)
+			if err != nil {
+				t.Fatalf("OpenFile 应接受目录条目 %v，却失败: %v", tc.dirs, err)
+			}
+			if err := loaded.VerifyLayers(); err != nil {
+				t.Fatalf("VerifyLayers 失败: %v", err)
+			}
+			// 目录条目不得被当成条目登记，否则层/配置交叉校验会被污染。
+			if _, ok := loaded.entries["layers/"]; ok {
+				t.Fatalf("目录条目 layers/ 被错误登记为文件条目")
+			}
+			if len(loaded.entries) != len(entries) {
+				t.Fatalf("条目数 = %d, want %d（目录条目不应计入）", len(loaded.entries), len(entries))
+			}
+		})
+	}
+}
+
+// TestOpenFileStillRejectsUnsafeFileEntries 确认放宽目录条目后，
+// 对**文件**条目的路径安全校验一个都没松。
+func TestOpenFileStillRejectsUnsafeFileEntries(t *testing.T) {
+	bad := []string{
+		"../evil",       // 上跳逃逸
+		"/abs/evil",     // 绝对路径
+		"./evil",        // 非规范化点前缀
+		"a/../b/evil",   // 中间上跳
+		"a//evil",       // 空段
+		`a\evil`,        // 反斜杠
+		"layers/./evil", // 点段
+	}
+	for _, name := range bad {
+		t.Run(name, func(t *testing.T) {
+			path := buildLiCore(t, t.TempDir(), "t.licore", map[string][]byte{name: []byte("x")})
+			if _, err := OpenFile(path); !errors.Is(err, ErrUnsafePath) {
+				t.Fatalf("条目 %q: err = %v, want ErrUnsafePath", name, err)
+			}
+		})
+	}
+	// 目录条目不能成为逃逸通道：即便叫 ../dir，也只是被跳过、不会被落盘。
+	t.Run("逃逸形态的目录条目被跳过", func(t *testing.T) {
+		entries, _ := licoreEntries(t)
+		path := buildLiCoreWithDirs(t, t.TempDir(), "t.licore", []string{"../evil/", "layers/"}, entries)
+		loaded, err := OpenFile(path)
+		if err != nil {
+			t.Fatalf("目录条目应被跳过: %v", err)
+		}
+		for k := range loaded.entries {
+			if strings.Contains(k, "..") {
+				t.Fatalf("条目中残留逃逸路径: %q", k)
+			}
+		}
+	})
 }

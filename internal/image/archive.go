@@ -74,6 +74,14 @@ func OpenFile(path string) (*Loaded, error) {
 		if err != nil {
 			return nil, fmt.Errorf("读取归档失败: %w", err)
 		}
+		// 目录条目先行跳过：任何常规打包工具（`tar -cf x.licore layers/ blobs/
+		// index.json` 这类手写归档）都会写入 "layers/" 这种带尾斜杠的目录条目，
+		// 而尾斜杠在 SafeArchivePath 眼里是一个空路径段。目录条目不携带文件
+		// 数据、也不参与落盘，对它们做路径规范化检查既无安全收益又挡住合法
+		// 输入，因此在类型分流里直接 continue，校验只针对有数据的条目。
+		if hdr.Typeflag == tar.TypeDir {
+			continue
+		}
 		if err := SafeArchivePath(hdr.Name); err != nil {
 			return nil, err
 		}
@@ -85,8 +93,6 @@ func OpenFile(path string) (*Loaded, error) {
 			if strings.HasPrefix(target, "/") || strings.Contains(target, "..") {
 				return nil, fmt.Errorf("条目 %q 链接目标 %q 逃逸: %w", hdr.Name, target, ErrUnsafePath)
 			}
-			continue
-		case tar.TypeDir:
 			continue
 		default:
 			return nil, fmt.Errorf("条目 %q 类型 %c 不允许出现在外层归档: %w", hdr.Name, hdr.Typeflag, ErrUnsafePath)
