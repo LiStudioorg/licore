@@ -115,7 +115,12 @@ func Enter(targetPID int, workdir, user string, env []string, inFd, outFd, errFd
 	if prog == nil {
 		return -1, nsenterMissingError()
 	}
-	argv, err := buildNsenterArgv(prog, targetPID, workdir, wrapWithHelper(helperPath, cmd))
+	// workdir 不再交给 nsenter 的 -w，而是经 argv 传给容器内的 helper。
+	// 原因：nsenter 的 -w 是"先 chdir 再 setns"，chdir 发生在**宿主** mount
+	// namespace；随后 setns 切到容器 mount ns，cwd 指向的 inode 在新视图里
+	// 可能不存在，getcwd 直接失败（真机实测报 getcwd: No such file or
+	// directory）。helper 本身就在容器 mount ns 内运行，它的 chdir 天然正确。
+	argv, err := buildNsenterArgv(prog, targetPID, wrapWithHelper(helperPath, workdir, cmd))
 	if err != nil {
 		return -1, err
 	}
@@ -150,10 +155,10 @@ func Enter(targetPID int, workdir, user string, env []string, inFd, outFd, errFd
 //
 // 形如：
 //
-//	nsenter -t <pid> -m -u -i -n -p -r/ -w<workdir> -- <cmd> <args...>
+//	nsenter -t <pid> -m -u -i -n -p -- <cmd> <args...>
 //
 // busybox 后备时为 `busybox nsenter -t ... -- ...`。
-func buildNsenterArgv(prog *nsenterProg, targetPID int, workdir string, cmd []string) ([]string, error) {
+func buildNsenterArgv(prog *nsenterProg, targetPID int, cmd []string) ([]string, error) {
 	if targetPID <= 0 {
 		return nil, fmt.Errorf("execns: target PID 非法: %d", targetPID)
 	}
@@ -180,12 +185,9 @@ func buildNsenterArgv(prog *nsenterProg, targetPID int, workdir string, cmd []st
 	// 当时还据此加了 -w/ 去补偿，等于用第二个参数掩盖第一个参数造成的问题。
 	// 现在两个默认都不下发：进容器后 cwd 天然就是 `/`，无需任何补偿。
 	//
-	// 仅当用户显式要求了工作目录（licore exec -w /app）才下发 -w。
-	// -w 的参数在 util-linux 与 busybox 上都是「可选」的，因此必须写成
-	// **紧贴**形式 "-w<dir>"；写成 "-w" "/app" 会把 /app 当成要执行的命令。
-	if workdir != "" && workdir != "/" {
-		argv = append(argv, "-w"+workdir)
-	}
+	// 刻意**不加 -w**：见 Enter 的说明——nsenter 的 -w 是"先 chdir 再 setns"，
+	// 切到容器 mount namespace 后 cwd 失效。工作目录改由容器内的 helper
+	// 自己 chdir（wrapWithHelper 把 workdir 放进 helper 的 argv）。
 	// `--` 终止选项解析：目标命令自身可能以 '-' 开头，不加会被当成 nsenter 的选项。
 	argv = append(argv, "--")
 	argv = append(argv, cmd...)
@@ -205,12 +207,18 @@ func buildNsenterArgv(prog *nsenterProg, targetPID int, workdir string, cmd []st
 //
 // helperPath 是容器内路径（见 runtime.HelperPathInContainer）：nsenter 的
 // -r/ 已把 root 切到容器，exec 的命令按容器视图解析。
-func wrapWithHelper(helperPath string, cmd []string) []string {
+func wrapWithHelper(helperPath, workdir string, cmd []string) []string {
 	if helperPath == "" {
 		return cmd
 	}
-	out := make([]string, 0, len(cmd)+3)
-	out = append(out, helperPath, "exec-setup", "--")
+	out := make([]string, 0, len(cmd)+6)
+	out = append(out, helperPath, "exec-setup")
+	// workdir 交给 helper 自己 chdir（见 Enter 的说明：nsenter 的 -w 会失效）。
+	// 空值或 "/" 不下发，helper 保持当前 cwd（进容器后天然是 /）。
+	if workdir != "" && workdir != "/" {
+		out = append(out, "--workdir", workdir)
+	}
+	out = append(out, "--")
 	out = append(out, cmd...)
 	return out
 }

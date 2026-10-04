@@ -24,23 +24,29 @@ import (
 // helper 在容器内被唤起，出错时几乎无法交互式排查，参数处理必须钉死。
 func TestParseExecSetupArgs(t *testing.T) {
 	cases := []struct {
-		name string
-		argv []string
-		want string
+		name        string
+		argv        []string
+		wantCmd     string
+		wantWorkdir string
 	}{
-		{"带分隔符", []string{"exec-setup", "--", "/bin/sh", "-c", "echo hi"}, "/bin/sh,-c,echo hi"},
-		{"不带分隔符", []string{"exec-setup", "/bin/sh", "-c", "echo hi"}, "/bin/sh,-c,echo hi"},
-		{"单命令", []string{"exec-setup", "--", "/bin/ls"}, "/bin/ls"},
-		{"命令以横杠开头", []string{"exec-setup", "--", "-weird"}, "-weird"},
+		{"带分隔符", []string{"exec-setup", "--", "/bin/sh", "-c", "echo hi"}, "/bin/sh,-c,echo hi", ""},
+		{"不带分隔符", []string{"exec-setup", "/bin/sh", "-c", "echo hi"}, "/bin/sh,-c,echo hi", ""},
+		{"单命令", []string{"exec-setup", "--", "/bin/ls"}, "/bin/ls", ""},
+		{"命令以横杠开头", []string{"exec-setup", "--", "-weird"}, "-weird", ""},
+		{"带 workdir", []string{"exec-setup", "--workdir", "/tmp", "--", "/bin/sh", "-c", "pwd"}, "/bin/sh,-c,pwd", "/tmp"},
+		{"workdir 之后仍有命令", []string{"exec-setup", "--workdir", "/app", "/bin/ls"}, "/bin/ls", "/app"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := ParseExecSetupArgs(tc.argv)
+			wd, cmd, err := ParseExecSetupArgs(tc.argv)
 			if err != nil {
 				t.Fatalf("ParseExecSetupArgs(%v): %v", tc.argv, err)
 			}
-			if strings.Join(got, ",") != tc.want {
-				t.Errorf("= %v，期望 %s", got, tc.want)
+			if strings.Join(cmd, ",") != tc.wantCmd {
+				t.Errorf("cmd = %v，期望 %s", cmd, tc.wantCmd)
+			}
+			if wd != tc.wantWorkdir {
+				t.Errorf("workdir = %q，期望 %q", wd, tc.wantWorkdir)
 			}
 		})
 	}
@@ -55,8 +61,11 @@ func TestParseExecSetupArgsRejects(t *testing.T) {
 		{"exec-setup", "--"},
 		{"exec-setup", "--", ""},
 		{"exec-setup", "--", "   "},
+		{"exec-setup", "--workdir", "/tmp"}, // 有 workdir 但没命令
+		{"exec-setup", "--workdir"},         // workdir 缺取值
+		{"exec-setup", "--workdir", "/tmp", "--"}, // 分隔符后没命令
 	} {
-		if _, err := ParseExecSetupArgs(argv); err == nil {
+		if _, _, err := ParseExecSetupArgs(argv); err == nil {
 			t.Errorf("argv=%v 应被拒绝", argv)
 		}
 	}
@@ -191,7 +200,28 @@ func TestInstallExecHelperCreatesDir(t *testing.T) {
 const (
 	envExecSetupProbe        = "LICORE_EXECSETUP_PROBE"
 	envExecSetupUnshareProbe = "LICORE_EXECSETUP_UNSHARE_PROBE"
+	envExecSetupWorkdirProbe = "LICORE_EXECSETUP_WD_PROBE"
 )
+
+// TestExecSetupWorkdirHelper 是 workdir 用例的子进程入口。
+//
+// 它调用真正的 RunExecSetup（带 --workdir），由 helper 完成 chdir 后
+// execve /bin/sh 打印 pwd——因此断言的是**收口路径本身**的 chdir 行为，
+// 而不是某个辅助函数。
+func TestExecSetupWorkdirHelper(t *testing.T) {
+	if os.Getenv(envExecSetupWorkdirProbe) != "1" {
+		return
+	}
+	wd := "/tmp"
+	if os.Getenv("LICORE_PROBE_BAD_WD") == "1" {
+		wd = "/definitely/not/here"
+	}
+	argv := []string{"exec-setup", "--workdir", wd, "--", "/bin/sh", "-c", "echo PWD=$(pwd)"}
+	err := RunExecSetup(argv)
+	// RunExecSetup 以 execve 结尾、成功不返回；返回即失败。
+	fmt.Printf("RUN_FAILED:%v\n", err)
+	os.Exit(1)
+}
 
 // TestExecSetupProbeHelperProcess 是 runExecSetupProbe 的子进程入口。
 func TestExecSetupProbeHelperProcess(t *testing.T) {
@@ -346,5 +376,108 @@ func TestSeccompGateInExecSetupIndependentOfCaps(t *testing.T) {
 	}
 	if got := lineWith(t, out, "UNSHARE_IS_EPERM="); got != "UNSHARE_IS_EPERM=true" {
 		t.Errorf("seccomp 收口应拦住 unshare，得到 %s", got)
+	}
+}
+
+// TestExecSetupProbeAppliesWorkdir 验证 helper **真的 chdir** 到指定目录。
+//
+// 这是 -w 的替代实现：nsenter 的 -w 在 mount ns 切换后失效，改由 helper
+// 自己 chdir。若这里没生效，`licore exec 容器 -w /app cmd` 会静默落在 /。
+//
+// 探针让 helper 在收口后执行 /bin/sh 打印 pwd；
+// 用 /tmp 作为目标（容器内外都存在，且不是默认的 /）。
+func TestExecSetupProbeAppliesWorkdir(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skipf("无法取自身路径: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe,
+		"-test.run=TestExecSetupWorkdirHelper", "-test.timeout=20s")
+	cmd.Env = envWith(os.Environ(), envExecSetupWorkdirProbe+"=1")
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if ctx.Err() != nil {
+		t.Fatalf("helper 超时未退出\n输出:\n%s", text)
+	}
+	// 无 CAP_SETPCAP 时能力裁剪会先失败，属于环境限制。
+	if strings.Contains(text, "PR_CAPBSET_DROP") && strings.Contains(text, "not permitted") {
+		t.Skipf("当前进程无 CAP_SETPCAP，无法走完整收口路径:\n%s", text)
+	}
+	if err != nil {
+		t.Fatalf("helper 失败: %v\n输出:\n%s", err, text)
+	}
+	if !strings.Contains(text, "PWD=/tmp") {
+		t.Errorf("helper 应在 chdir 后执行命令（期望 PWD=/tmp），输出:\n%s", text)
+	}
+}
+
+// TestExecSetupProbeWorkdirMissing 验证 chdir 到不存在的目录时**明确报错**，
+// 不静默降级到别的目录。
+func TestExecSetupProbeWorkdirMissing(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skipf("无法取自身路径: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe,
+		"-test.run=TestExecSetupWorkdirHelper", "-test.timeout=20s")
+	cmd.Env = envWith(os.Environ(), envExecSetupWorkdirProbe+"=1", "LICORE_PROBE_BAD_WD=1")
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if ctx.Err() != nil {
+		t.Fatalf("helper 超时未退出\n输出:\n%s", text)
+	}
+	if strings.Contains(text, "PR_CAPBSET_DROP") && strings.Contains(text, "not permitted") {
+		t.Skipf("当前进程无 CAP_SETPCAP，无法走完整收口路径:\n%s", text)
+	}
+	if err == nil {
+		t.Fatalf("chdir 到不存在的目录应失败，却成功了:\n%s", text)
+	}
+	if !strings.Contains(text, "切换工作目录") {
+		t.Errorf("错误信息应说明是切换工作目录失败:\n%s", text)
+	}
+}
+
+// TestChdirIfSet 直接验证 chdir 逻辑本身（不经过能力裁剪）。
+//
+// 为什么单独测：RunExecSetup 里 chdir 排在 cap-drop 之后，而沙箱没有
+// CAP_SETPCAP，裁剪会先失败，导致 chdir 那几行在本机永远跑不到。
+// 抽成 chdirIfSet 后这段逻辑在无特权环境也能被完整覆盖。
+func TestChdirIfSet(t *testing.T) {
+	old, err := os.Getwd()
+	if err != nil {
+		t.Skip("无法取 cwd")
+	}
+	defer func() { _ = os.Chdir(old) }()
+
+	target := t.TempDir()
+	// 空值：不切换。
+	if err := chdirIfSet(""); err != nil {
+		t.Errorf("空 workdir 不应报错: %v", err)
+	}
+	if wd, _ := os.Getwd(); wd != old {
+		t.Errorf("空 workdir 不应改变 cwd，得到 %q", wd)
+	}
+	// 有效目录：切换成功。
+	if err := chdirIfSet(target); err != nil {
+		t.Fatalf("chdir 到 %s 失败: %v", target, err)
+	}
+	got, _ := os.Getwd()
+	// macOS 的 /var 是软链，用 EvalSymlinks 归一化后再比。
+	wantResolved, _ := filepath.EvalSymlinks(target)
+	gotResolved, _ := filepath.EvalSymlinks(got)
+	if gotResolved != wantResolved {
+		t.Errorf("cwd = %q，期望 %q", gotResolved, wantResolved)
+	}
+	// 不存在的目录：明确报错（不静默降级）。
+	err = chdirIfSet("/definitely/not/here")
+	if err == nil {
+		t.Fatal("chdir 到不存在的目录应报错")
+	}
+	if !strings.Contains(err.Error(), "切换工作目录") || !strings.Contains(err.Error(), "/definitely/not/here") {
+		t.Errorf("错误信息应说明目录与原因: %v", err)
 	}
 }

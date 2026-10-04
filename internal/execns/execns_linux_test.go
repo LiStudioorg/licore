@@ -94,7 +94,7 @@ func TestEnterWithoutNsenterReportsInstallHint(t *testing.T) {
 // TestBuildNsenterArgvSystemBinary 命令构造的核心断言。
 func TestBuildNsenterArgvSystemBinary(t *testing.T) {
 	prog := &nsenterProg{path: "/usr/bin/nsenter"}
-	got, err := buildNsenterArgv(prog, 4242, "", []string{"/bin/sh", "-c", "hostname"})
+	got, err := buildNsenterArgv(prog, 4242, []string{"/bin/sh", "-c", "hostname"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestBuildNsenterArgvSystemBinary(t *testing.T) {
 // TestBuildNsenterArgvBusybox 后备时要有 busybox nsenter 前缀。
 func TestBuildNsenterArgvBusybox(t *testing.T) {
 	prog := &nsenterProg{path: "/bin/busybox", args: []string{"nsenter"}}
-	got, err := buildNsenterArgv(prog, 7, "", []string{"/bin/echo", "hi"})
+	got, err := buildNsenterArgv(prog, 7, []string{"/bin/echo", "hi"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestBuildNsenterArgvBusybox(t *testing.T) {
 // 所以长选项虽然更可读却不是可移植选择。
 func TestBuildNsenterArgvUsesShortOptions(t *testing.T) {
 	prog := &nsenterProg{path: "/usr/bin/nsenter"}
-	got, err := buildNsenterArgv(prog, 1, "", []string{"/bin/true"})
+	got, err := buildNsenterArgv(prog, 1, []string{"/bin/true"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,86 +139,35 @@ func TestBuildNsenterArgvUsesShortOptions(t *testing.T) {
 	}
 }
 
-// TestBuildNsenterArgvWorkdirAttached 回归：-w 必须紧贴路径。
-// -w 的参数在 util-linux 与 busybox 上都是可选的，写成 "-w" "/app"
-// 会把 /app 当成要执行的命令（实测报 failed to execute）。
-func TestBuildNsenterArgvWorkdirAttached(t *testing.T) {
+// TestBuildNsenterArgvNeverSetsRootOrWorkdir 回归：命令行里**不得**出现 -r 与 -w。
+//
+// 两条都来自真机实测的教训，而且本仓库曾经把结论写反过：
+//
+//	setns(CLONE_NEWNS) 之后进程根目录已经是容器 root，nsenter 再 chroot
+//	一次属于多余操作，并且会把 cwd 搞坏；
+//
+//	nsenter 的 -w 是"先 chdir 再 setns"——chdir 发生在**宿主** mount
+//	namespace，随后切到容器 mount ns，cwd 指向的 inode 在新视图里可能不存在，
+//	getcwd 直接失败。实测（真机，容器 PID 1）：
+//
+//	  nsenter -t <pid> -m -u -i -n -p      -- /bin/busybox pwd  → /
+//	  nsenter -t <pid> -m -u -i -n -p -w/tmp -- /bin/busybox pwd → getcwd 报错
+//
+// 工作目录改由容器内的 helper 自己 chdir（见 wrapWithHelper 与
+// TestWrapWithHelperCarriesWorkdir）。这条用例把"不许再加回 -r/-w"钉死。
+func TestBuildNsenterArgvNeverSetsRootOrWorkdir(t *testing.T) {
 	prog := &nsenterProg{path: "/usr/bin/nsenter"}
-	got, err := buildNsenterArgv(prog, 1, "/app", []string{"/bin/sh"})
+	got, err := buildNsenterArgv(prog, 1, []string{"/bin/sh"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	joined := strings.Join(got, " ")
-	if !strings.Contains(joined, "-w/app") {
-		t.Errorf("workdir 应写成紧贴形式 -w/app，得到 %v", got)
-	}
-	for i, a := range got {
-		if a == "-w" {
-			t.Errorf("-w 与路径分开了（会被当成命令）: %v", got)
-			_ = i
+	for _, a := range got {
+		if a == "-r/" || strings.HasPrefix(a, "-r") {
+			t.Errorf("不应出现 -r（会导致 cwd 失效）: %v", got)
 		}
-	}
-}
-
-// TestBuildNsenterArgvNeverSetsRoot 回归：命令行里**不得**出现 -r/。
-//
-// 这是一条来自真机的教训，而且本仓库曾经把结论写反过：
-// setns(CLONE_NEWNS) 之后进程根目录已经是容器 root，nsenter 再 chroot 一次
-// 属于多余操作，并且会把 cwd 搞坏——实测
-//
-//	nsenter -t <pid> -m -u -i -n -p      -- /bin/busybox pwd  → 输出 /
-//	nsenter -t <pid> -m -u -i -n -p -r/ -w/ -- /bin/busybox pwd → getcwd 报错
-//
-// 早先的代码与注释断言"不加 -r/ 会导致 cwd 失效"，据此加了 -r/ 再用 -w/ 补偿，
-// 结果两处一起把 exec 弄坏了（helper 报 No such file or directory）。
-// 这条用例把"不许再加回 -r/"钉死。
-func TestBuildNsenterArgvNeverSetsRoot(t *testing.T) {
-	prog := &nsenterProg{path: "/usr/bin/nsenter"}
-	for _, workdir := range []string{"", "/", "/app"} {
-		got, err := buildNsenterArgv(prog, 1, workdir, []string{"/bin/sh"})
-		if err != nil {
-			t.Fatal(err)
+		if a == "-w" || strings.HasPrefix(a, "-w") {
+			t.Errorf("不应出现 -w（nsenter 的 -w 在 mount ns 切换后失效）: %v", got)
 		}
-		for _, a := range got {
-			if a == "-r/" || strings.HasPrefix(a, "-r") {
-				t.Errorf("workdir=%q 时不应出现 -r（会导致 cwd 失效）: %v", workdir, got)
-			}
-		}
-	}
-}
-
-// TestBuildNsenterArgvWorkdirOnlyWhenRequested 验证 -w 只在用户显式要求时下发。
-//
-// 不下发时容器内 cwd 天然是 `/`（实测），因此无需用 -w/ 去"补偿"。
-// 显式要求时必须写成紧贴形式 -w<dir>：写成 "-w" "/app" 会把 /app 当成要执行的命令。
-func TestBuildNsenterArgvWorkdirOnlyWhenRequested(t *testing.T) {
-	prog := &nsenterProg{path: "/usr/bin/nsenter"}
-
-	// 未指定或指定为 "/"：不下发 -w。
-	for _, workdir := range []string{"", "/"} {
-		got, err := buildNsenterArgv(prog, 1, workdir, []string{"/bin/sh"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, a := range got {
-			if strings.HasPrefix(a, "-w") {
-				t.Errorf("workdir=%q 时不应下发 -w（容器内默认已是 /）: %v", workdir, got)
-			}
-		}
-	}
-
-	// 显式要求：下发紧贴形式的 -w/app。
-	got, err := buildNsenterArgv(prog, 1, "/app", []string{"/bin/sh"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	joined := strings.Join(got, " ")
-	if !strings.Contains(joined, "-w/app ") {
-		t.Errorf("显式 workdir 应下发紧贴形式 -w/app，得到 %v", got)
-	}
-	// 绝不能出现 "-w /app" 这种分离写法（会把 /app 当成命令）。
-	if strings.Contains(joined, "-w /app") {
-		t.Errorf("-w 与目录之间不能有空格: %v", got)
 	}
 }
 
@@ -226,7 +175,7 @@ func TestBuildNsenterArgvWorkdirOnlyWhenRequested(t *testing.T) {
 // 必须靠 "--" 终止选项解析，否则会被 nsenter 当成自己的选项。
 func TestBuildNsenterArgvDoubleDashProtectsDashCommand(t *testing.T) {
 	prog := &nsenterProg{path: "/usr/bin/nsenter"}
-	got, err := buildNsenterArgv(prog, 1, "", []string{"-weird-binary", "-x"})
+	got, err := buildNsenterArgv(prog, 1, []string{"-weird-binary", "-x"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +209,7 @@ func TestBuildNsenterArgvRejectsBadInput(t *testing.T) {
 		{"prog 为空", 1, []string{"/bin/sh"}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := buildNsenterArgv(tc.prog, tc.pid, "", tc.cmd); err == nil {
+			if _, err := buildNsenterArgv(tc.prog, tc.pid, tc.cmd); err == nil {
 				t.Error("应报错")
 			}
 		})
@@ -315,7 +264,7 @@ func TestParseExecUser(t *testing.T) {
 // TestInsertUserFlagsPlacement -S/-G 必须插在 "--" 之前。
 func TestInsertUserFlagsPlacement(t *testing.T) {
 	prog := &nsenterProg{path: "/usr/bin/nsenter"}
-	argv, err := buildNsenterArgv(prog, 1, "", []string{"/bin/sh"})
+	argv, err := buildNsenterArgv(prog, 1, []string{"/bin/sh"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +290,7 @@ func TestInsertUserFlagsPlacement(t *testing.T) {
 // TestInsertUserFlagsOmitsGid 只给 uid 时不应出现 -G。
 func TestInsertUserFlagsOmitsGid(t *testing.T) {
 	prog := &nsenterProg{path: "/usr/bin/nsenter"}
-	argv, _ := buildNsenterArgv(prog, 1, "", []string{"/bin/sh"})
+	argv, _ := buildNsenterArgv(prog, 1, []string{"/bin/sh"})
 	got := insertUserFlags(argv, prog, 1000, -1)
 	if strings.Contains(strings.Join(got, " "), "-G") {
 		t.Errorf("未指定 gid 时不应有 -G: %v", got)
@@ -368,7 +317,7 @@ func TestRealNsenterIfPresent(t *testing.T) {
 	}
 	// -t <自身 pid> 进入「自己已在的」命名空间，无需特权即可成功。
 	prog := findNsenterReal()
-	argv, err := buildNsenterArgv(prog, selfPID(), "", []string{"/bin/echo", "nsenter-smoke"})
+	argv, err := buildNsenterArgv(prog, selfPID(), []string{"/bin/echo", "nsenter-smoke"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,17 +357,52 @@ func selfPID() int { return os.Getpid() }
 // 再 execve 用户命令。若包装丢了，"exec 只允许收紧"就无从谈起。
 func TestWrapWithHelper(t *testing.T) {
 	// helperPath 为空：保持原行为（不包）。
-	got := wrapWithHelper("", []string{"/bin/sh", "-c", "hi"})
+	got := wrapWithHelper("", "", []string{"/bin/sh", "-c", "hi"})
 	if strings.Join(got, " ") != "/bin/sh -c hi" {
 		t.Errorf("空 helperPath 应原样返回，得到 %v", got)
 	}
 
-	// 非空：包成 <helper> exec-setup -- <cmd...>
-	got = wrapWithHelper("/.licore/exec-helper", []string{"/bin/sh", "-c", "hi"})
+	// 无 workdir：包成 <helper> exec-setup -- <cmd...>
+	got = wrapWithHelper("/.licore/exec-helper", "", []string{"/bin/sh", "-c", "hi"})
 	want := "/.licore/exec-helper exec-setup -- /bin/sh -c hi"
 	if strings.Join(got, " ") != want {
 		t.Errorf("argv =\n  %v\nwant\n  %v", got, want)
 	}
+}
+
+// TestWrapWithHelperCarriesWorkdir 验证 workdir 经 argv 传给 helper。
+//
+// 这是 -w 的**替代实现**：nsenter 的 -w 在 mount ns 切换后会失效
+// （先 chdir 再 setns），因此改由容器内的 helper 自己 chdir。
+// 若 workdir 没被带进 argv，`licore exec 容器 -w /app cmd` 会静默落在 /。
+func TestWrapWithHelperCarriesWorkdir(t *testing.T) {
+	got := wrapWithHelper("/.licore/exec-helper", "/app", []string{"/bin/sh"})
+	want := "/.licore/exec-helper exec-setup --workdir /app -- /bin/sh"
+	if strings.Join(got, " ") != want {
+		t.Errorf("argv =\n  %v\nwant\n  %v", got, want)
+	}
+	// workdir 必须在 -- 之前，否则会被当成用户命令的一部分。
+	iWD, iDD := indexOfStr(got, "--workdir"), indexOfStr(got, "--")
+	if iWD < 0 || iDD < 0 || iWD > iDD {
+		t.Errorf("--workdir 必须在 -- 之前: %v", got)
+	}
+
+	// 空或 "/"：不下发 --workdir（进容器后 cwd 天然是 /）。
+	for _, wd := range []string{"", "/"} {
+		if indexOfStr(wrapWithHelper("/.licore/exec-helper", wd, []string{"/bin/sh"}), "--workdir") >= 0 {
+			t.Errorf("workdir=%q 时不应下发 --workdir", wd)
+		}
+	}
+}
+
+// indexOfStr 返回 s 在切片中的下标，不存在返回 -1。
+func indexOfStr(ss []string, s string) int {
+	for i, v := range ss {
+		if v == s {
+			return i
+		}
+	}
+	return -1
 }
 
 // TestBuildNsenterArgvWithHelper 验证经 nsenter 之后的完整命令行。
@@ -427,8 +411,8 @@ func TestWrapWithHelper(t *testing.T) {
 // 少了 -- 时，以 '-' 开头的用户命令会被 nsenter 当成自己的选项。
 func TestBuildNsenterArgvWithHelper(t *testing.T) {
 	prog := &nsenterProg{path: "/usr/bin/nsenter"}
-	cmd := wrapWithHelper("/.licore/exec-helper", []string{"/bin/sh", "-c", "hostname"})
-	got, err := buildNsenterArgv(prog, 4242, "", cmd)
+	cmd := wrapWithHelper("/.licore/exec-helper", "", []string{"/bin/sh", "-c", "hostname"})
+	got, err := buildNsenterArgv(prog, 4242, cmd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,5 +425,32 @@ func TestBuildNsenterArgvWithHelper(t *testing.T) {
 	}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("argv =\n  %v\nwant\n  %v", got, want)
+	}
+}
+
+// TestBuildNsenterArgvWithHelperAndWorkdir 验证带 workdir 的完整形态：
+// -w 不在 nsenter 侧，workdir 落在 helper 的 argv 里。
+func TestBuildNsenterArgvWithHelperAndWorkdir(t *testing.T) {
+	prog := &nsenterProg{path: "/usr/bin/nsenter"}
+	cmd := wrapWithHelper("/.licore/exec-helper", "/tmp", []string{"/bin/sh", "-c", "pwd"})
+	got, err := buildNsenterArgv(prog, 4242, cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"/usr/bin/nsenter",
+		"-t", "4242",
+		"-m", "-u", "-i", "-n", "-p",
+		"--",
+		"/.licore/exec-helper", "exec-setup", "--workdir", "/tmp", "--",
+		"/bin/sh", "-c", "pwd",
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("argv =\n  %v\nwant\n  %v", got, want)
+	}
+	for _, a := range got {
+		if strings.HasPrefix(a, "-w") {
+			t.Errorf("nsenter 侧不应出现 -w: %v", got)
+		}
 	}
 }

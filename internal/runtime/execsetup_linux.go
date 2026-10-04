@@ -12,6 +12,13 @@ import (
 	"syscall"
 )
 
+// helperArgv0Marker 是补 argv[0] 时使用的占位符。
+//
+// ParseExecSetupArgs 的约定是"argv 含 argv[0]"，而 CLI 子命令拿到的是
+// cobra 的 args（不含）。用一个固定标记补位，使两条路径共用同一套解析，
+// 同时可被测试识别——比"看长度猜"可靠。
+const helperArgv0Marker = "exec-setup"
+
 // RunExecSetup 是 `licore exec` 的收口入口：在**容器内**被 nsenter 唤起，
 // 按容器配置收紧权限后 execve 用户命令。
 //
@@ -24,13 +31,16 @@ import (
 //	licore exec-setup [--] <cmd> <args...>
 //
 // 收口规格经环境变量下发（LICORE_CAPS_DROP），与容器 init 一致。
-func RunExecSetup(args []string) error {
-	// 去掉可选的分隔符 "--"。execns 侧始终会加，但保留容错。
-	if len(args) > 0 && args[0] == "--" {
-		args = args[1:]
+func RunExecSetup(argv []string) error {
+	// 约定：argv **含 argv[0]**（helper 自身路径），与真实进程的 os.Args 一致。
+	// CLI 子命令传入的是 cobra 的 args（不含 argv[0]），因此这里补一个占位，
+	// 让两条调用路径共用同一套解析。
+	if len(argv) == 0 || argv[0] != helperArgv0Marker {
+		argv = append([]string{helperArgv0Marker}, argv...)
 	}
-	if len(args) == 0 {
-		return fmt.Errorf("exec-setup: 缺少要执行的命令: %w", ErrBadConfig)
+	workdir, cmd, err := ParseExecSetupArgs(argv)
+	if err != nil {
+		return err
 	}
 
 	// 1. no_new_privs：阻止 execve 获得新特权（与容器 init 同一顺序第一步）。
@@ -50,10 +60,22 @@ func RunExecSetup(args []string) error {
 		return fmt.Errorf("exec-setup: 安装 seccomp 过滤器失败: %w", err)
 	}
 
-	// 4. execve 用户命令。路径在容器视图内解析（此时已在容器的 mount ns 里）。
+	// 4. 工作目录：**在这里 chdir**，而不是交给 nsenter 的 -w。
+	//
+	// nsenter 的 -w 是"先 chdir 再 setns"：chdir 发生在宿主 mount namespace，
+	// 随后切到容器 mount ns，cwd 指向的 inode 在新视图里可能不存在，
+	// getcwd 直接失败（真机实测报 getcwd: No such file or directory）。
+	// helper 本身就在容器的 mount ns 内运行，它的 chdir 天然正确。
+	//
+	// 失败必须明确报错：静默忽略会让用户以为 -w 生效了，实际落在别的目录。
+	if err := chdirIfSet(workdir); err != nil {
+		return err
+	}
+
+	// 5. execve 用户命令。路径在容器视图内解析（此时已在容器的 mount ns 里）。
 	env := envWithoutLiCore()
-	if err := syscall.Exec(args[0], args, env); err != nil {
-		return fmt.Errorf("exec-setup: exec %s: %w", args[0], err)
+	if err := syscall.Exec(cmd[0], cmd, env); err != nil {
+		return fmt.Errorf("exec-setup: exec %s: %w", cmd[0], err)
 	}
 	return nil // 不可达
 }
@@ -106,4 +128,19 @@ func InstallExecHelper(rootfs string) error {
 func execHelperAvailableInRootfs(rootfs string) bool {
 	fi, err := os.Stat(rootfs + HelperPathInContainer)
 	return err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0
+}
+
+// chdirIfSet 在 workdir 非空时切换当前工作目录。
+//
+// 抽成独立函数是为了能在**无特权**环境直接验证：真实 RunExecSetup 里
+// chdir 排在能力裁剪之后，而沙箱没有 CAP_SETPCAP，裁剪会先失败，
+// chdir 那几行永远跑不到——那样这段逻辑在本机就没有任何覆盖。
+func chdirIfSet(workdir string) error {
+	if workdir == "" {
+		return nil
+	}
+	if err := os.Chdir(workdir); err != nil {
+		return fmt.Errorf("exec-setup: 切换工作目录到 %q 失败: %w", workdir, err)
+	}
+	return nil
 }

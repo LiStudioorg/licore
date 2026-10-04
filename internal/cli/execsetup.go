@@ -31,11 +31,9 @@ func newExecSetupCommand(_ io.Writer) *cobra.Command {
 		DisableFlagParsing: true,
 		Args:               cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
-			cmdline, err := runtime.ParseExecSetupArgs(append([]string{"exec-setup"}, args...))
-			if err != nil {
-				return err
-			}
-			return runtime.RunExecSetup(cmdline)
+			// 直接把手上的 argv 交给 runtime：解析与执行都在那边，
+			// 避免两处各解析一遍导致行为漂移。
+			return runtime.RunExecSetup(args)
 		},
 	}
 }

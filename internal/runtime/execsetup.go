@@ -83,7 +83,16 @@ func ExecSetupCapsDrop() []string {
 	return out
 }
 
-// ParseExecSetupArgs 解析 helper 的 argv（丢掉 argv[0] 与可选 "--"）。
+// ParseExecSetupArgs 解析 helper 的 argv（含 argv[0]）。
+//
+// 形如：
+//
+//	exec-setup [--workdir <dir>] -- <cmd> <args...>
+//
+// workdir 经由 argv 下发而**不是** nsenter 的 -w：nsenter 的 -w 是
+// "先 chdir 再 setns"，chdir 发生在宿主 mount namespace，切到容器 mount ns
+// 后 cwd 指向的 inode 可能不存在，getcwd 会失败（真机实测）。helper 本身就在
+// 容器 mount ns 内，它的 chdir 天然正确。
 //
 // **刻意不加 build tag**：CLI 的隐藏子命令 `exec-setup` 在所有平台都要注册
 // 并解析参数，只有真正执行收口的 RunExecSetup 是 Linux 专属。
@@ -91,19 +100,34 @@ func ExecSetupCapsDrop() []string {
 //
 // 独立成函数是为了让参数处理可被单测覆盖：helper 在容器内被唤起，
 // 出错时几乎无法交互式排查，必须在启动前用测试钉住。
-func ParseExecSetupArgs(argv []string) ([]string, error) {
+func ParseExecSetupArgs(argv []string) (workdir string, cmd []string, err error) {
 	if len(argv) == 0 {
-		return nil, fmt.Errorf("exec-setup: argv 为空: %w", ErrBadConfig)
+		return "", nil, fmt.Errorf("exec-setup: argv 为空: %w", ErrBadConfig)
 	}
 	rest := argv[1:] // 丢掉 argv[0]（helper 自身路径）
-	if len(rest) > 0 && rest[0] == "--" {
-		rest = rest[1:]
+	for i := 0; i < len(rest); i++ {
+		a := rest[i]
+		if a == "--" {
+			cmd = rest[i+1:]
+			break
+		}
+		if a == "--workdir" {
+			if i+1 >= len(rest) {
+				return "", nil, fmt.Errorf("exec-setup: --workdir 缺少取值: %w", ErrBadConfig)
+			}
+			i++
+			workdir = rest[i]
+			continue
+		}
+		// 兼容不带 --workdir / -- 的旧形态：其后全部是命令。
+		cmd = rest[i:]
+		break
 	}
-	if len(rest) == 0 {
-		return nil, fmt.Errorf("exec-setup: 缺少要执行的命令: %w", ErrBadConfig)
+	if len(cmd) == 0 {
+		return "", nil, fmt.Errorf("exec-setup: 缺少要执行的命令: %w", ErrBadConfig)
 	}
-	if strings.TrimSpace(rest[0]) == "" {
-		return nil, fmt.Errorf("exec-setup: 命令为空: %w", ErrBadConfig)
+	if strings.TrimSpace(cmd[0]) == "" {
+		return "", nil, fmt.Errorf("exec-setup: 命令为空: %w", ErrBadConfig)
 	}
-	return rest, nil
+	return workdir, cmd, nil
 }
