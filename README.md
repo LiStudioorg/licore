@@ -102,8 +102,8 @@ tar -xzf licore-linux-amd64.tar.gz          # 内含 licore + README.md + LICENS
 sudo install -m 0755 licore /usr/local/bin/licore
 ```
 
-归档命名规则：`licore-<os>-<arch>[-cgo].tar.gz`。带 **`-cgo`** 后缀的包支持
-`licore exec`，不带的为纯 Go 构建（exec 不可用，其余功能完整）。
+归档命名规则：`licore-<os>-<arch>.tar.gz`。全部是纯 Go 静态二进制，
+`licore exec` 是否可用取决于运行环境有没有 `nsenter`（见下文）。
 
 ### 方式三：从源码编译
 
@@ -115,18 +115,19 @@ make all              # linux/amd64 + linux/arm64 + android/arm64，产物在 di
 go build -o licore .
 ```
 
-> ⚠️ `make install` 与 `make linux` 产出的是**纯 Go** 构建，**没有 `licore exec`**。
-> 需要 exec 请显式启用 cgo：`CGO_ENABLED=1 go build -o licore .`（详见《构建矩阵》）。
+> ✅ 所有构建都是**纯 Go 静态二进制**（`CGO_ENABLED=0`），无 glibc / 动态库依赖，
+> 也不需要 C 工具链或 Android NDK。
+> `licore exec` 依赖系统提供的 **`nsenter`**（util-linux、Toybox 均自带；旧版
+> Android 可装 busybox / Magisk）。详见《构建矩阵》与 [docs/android-root.md](docs/android-root.md)。
 
 ### 平台支持矩阵
 
-| 平台 | 安装方式 | 是否可用 | root | cgo | `licore exec` |
-| --- | --- | --- | --- | --- | --- |
-| Linux amd64 / arm64 | 一行命令 / 手动 / 源码 | ✅ 完整支持 | 需要（网络、cgroup、exec） | 可选 | 仅 `-cgo` 包 |
-| Linux arm / 386 / riscv64 | 一行命令 / 手动 / 源码 | ✅ 完整支持 | 需要 | 仅提供纯 Go | ❌ 明确报错 |
-| Android arm64（有 Root） | 一行命令 / 手动 / NDK 编译 | ✅ 官方原生支持 | 需要 | 一行命令默认取 `-cgo` 包 | ✅（cgo 包） |
-| Android arm64（无 Root） | — | ❌ 官方不支持 | — | — | — |
-| macOS amd64 / arm64 | 一行命令 / 手动 / 源码 | ⚠️ 通过轻量 VM | 不需要 | 仅提供纯 Go | ❌ |
+| 平台 | 安装方式 | 是否可用 | root | `licore exec`（需 nsenter） |
+| --- | --- | --- | --- | --- |
+| Linux amd64 / arm64 / arm / 386 / riscv64 | 一行命令 / 手动 / 源码 | ✅ 完整支持 | 需要（网络、cgroup、exec） | ✅ util-linux 标配 |
+| Android arm64（有 Root） | 一行命令 / 手动 / 源码 | ✅ 官方原生支持 | 需要 | ✅ Toybox 自带（旧版需 busybox） |
+| Android arm64（无 Root） | — | ❌ 官方不支持 | — | — |
+| macOS amd64 / arm64 | 一行命令 / 手动 / 源码 | ⚠️ 通过轻量 VM | 不需要 | ⚠️ VM 内有 nsenter 即可 |
 
 - **Linux 非 root**：镜像、卷、`build`、`run`（host/none 网络）可用；网络 veth、cgroup 限制、
   `exec` 需要 root。
@@ -280,15 +281,16 @@ licore exec -e FOO=bar -w /data -u 1000 myapp /bin/env   # 环境变量 / 工作
 需要 root。交互模式可带 `-i`（保持 stdin）与 `-t`（伪终端）。
 
 > **构建说明**：纯 Go 无法 `setns(CLONE_NEWNS)`（见 Go issue #9091），因此进入容器
-> **挂载命名空间**这一步由可选的 cgo 组件 `internal/execns` 完成。这是全仓库唯一的 cgo
-> 代码，且仅在 Linux + 启用 cgo 时编译：
+> **进入挂载命名空间**这一步由系统的 **`nsenter`** 完成（`internal/execns` 只负责
+> 探测与命令构造）。纯 Go 无法直接 `setns(CLONE_NEWNS)`（Go issue #9091），
+> nsenter 是一个单线程、exec 前的 C 程序，正好补上这一步：
 >
-> - `go build -o licore .`（默认，Linux + cgo 可用）→ `exec` 功能完整。
-> - `CGO_ENABLED=0 go build -o licore .` 或 `-tags nocgo_exec` → 自动走纯 Go stub，
->   其余功能完全不受影响，只有 `licore exec` 会返回明确的"未启用 cgo 支持"错误。
-> - `GOOS=android` 官方交叉编译为纯 Go，`exec` 同样返回明确错误；需要 Android 上
->   的 `exec` 请用 NDK 工具链做 cgo 交叉编译（见 [docs/android-root.md](docs/android-root.md) 第 2 节）。
-> - 交叉编译到 linux/arm64 需要对应架构的 C 工具链；没有时可加 `-tags nocgo_exec`。
+> - 二进制本身**始终是纯 Go**（`CGO_ENABLED=0`），静态链接、无 glibc 依赖。
+> - `exec` 是否可用取决于**运行环境有没有 nsenter**，与编译方式无关：
+>   同一个二进制在装了 util-linux 的机器上可用，反之返回明确的安装提示。
+> - 探测顺序：`nsenter` → `busybox nsenter`（Magisk / 精简 Android 常见）。
+> - Android 10+ 由 Toybox 自带 nsenter；更早版本可能需装 busybox 或 Magisk。
+> - macOS / Windows 上 `exec` 不可用（需在 VM / WSL2 内运行）。
 
 ## 自建 Hub 服务（hub serve）
 
@@ -330,17 +332,20 @@ licore boot disable                       # 移除系统服务
 > 下表是**真机逐项实测**的结果。之所以不标版本号：能力矩阵只在重新跑一遍真机验收时才更新，
 > 而版本号每发一次就会变，写死会让读者误以为矩阵已经过时。**没在真机上重测过，就不改这里的 ✅/❌。**
 
-| 能力 | Linux（root） | Linux（非 root） | Android（root） | macOS | `CGO_ENABLED=0` 构建 |
-| --- | --- | --- | --- | --- | --- |
-| 镜像 / 卷 / `build` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `run` / `stop` / `ps` / `rm` | ✅ | ✅ | ✅ | — | ✅ |
-| 网络（bridge / veth / NAT / DNS） | ✅ | 仅 host / none | ✅ | — | ✅ |
-| 资源限制（cgroup） | ✅ v2 | ⚠️ 视 cgroup 委派而定 | ✅ v2 优先，自动回退 v1 | — | ✅ |
-| `exec` 进入命名空间 | ✅ | ❌（需 CAP_SYS_ADMIN） | ✅ 仅 cgo 构建¹ | ❌ | ❌ 返回明确错误 |
-| 卷 `:ro` 只读 | ✅ | ✅ | ✅ | — | ✅ |
-| 开机自启（boot enable） | ✅ systemd | ✅ systemd（用户级视环境） | ❌ Magisk 后端未实现² | — | ✅ |
+| 能力 | Linux（root） | Linux（非 root） | Android（root） | macOS |
+| --- | --- | --- | --- | --- |
+| 镜像 / 卷 / `build` | ✅ | ✅ | ✅ | ✅ |
+| `run` / `stop` / `ps` / `rm` | ✅ | ✅ | ✅ | — |
+| 网络（bridge / veth / NAT / DNS） | ✅ | 仅 host / none | ✅ | — |
+| 资源限制（cgroup） | ✅ v2 | ⚠️ 视 cgroup 委派而定 | ✅ v2 优先，自动回退 v1 | — |
+| `exec` 进入命名空间 | ✅ | ❌（需 CAP_SYS_ADMIN） | ✅ 需系统有 nsenter¹ | ❌ |
+| 卷 `:ro` 只读 | ✅ | ✅ | ✅ | — |
+| 开机自启（boot enable） | ✅ systemd | ✅ systemd（用户级视环境） | ❌ Magisk 后端未实现² | — |
 
-¹ 官方 `GOOS=android` 交叉编译是纯 Go，`exec` 返回明确错误；用 NDK 做 cgo 交叉编译后完整可用。
+> 上表不再有 "`CGO_ENABLED=0` 构建" 一列：v0.8.0 起所有构建都是纯 Go，
+> 不再存在「纯 Go 就缺功能」的分别。
+
+¹ Android 10+ 由 Toybox 自带 nsenter；更早版本可能需安装 busybox（`busybox nsenter` 后备）。
 ² 临时替代：手动放置 `/data/adb/service.d/licore.sh`（见 [docs/android-root.md](docs/android-root.md) 第 2 节）。
 
 ### 已知限制
@@ -351,9 +356,11 @@ licore boot disable                       # 移除系统服务
   且没有放行 licore 网桥的规则（部分云主机、启用 rootless-docker 的机器如此），
   `-p` 发布的端口从宿主外部不可达。这与 Docker 在同一台机器上的行为一致；此时
   licore 会打印告警，容器间通信与出网不受影响。可用 `licore network ls` 确认网桥状态。
-- **`exec` 需要 cgo 构建**：见上文《进入运行中容器（exec）》的构建说明。
-- **层缓存不回收**：`licore rm` 只删容器目录，共享的 `layers/sha256/<hex>/fs` 缓存
-  跨容器复用且不会自动清理（引用计数尚未实现）。
+- **`exec` 依赖系统 `nsenter`**：util-linux（Linux）、Toybox（Android 10+）自带；
+  旧版 Android 需装 busybox。缺失时 `licore exec` 返回带安装指引的明确错误，
+  其余功能完全不受影响。macOS / Windows 上 `exec` 不可用（需在 VM / WSL2 内运行）。
+- **层缓存不回收**：`licore rmi` 只删镜像目录，共享的 `layers/sha256/<hex>/fs`
+  缓存跨镜像复用且不会自动清理（引用计数尚未实现；`licore images prune` 在路线图上）。
 - **未实现的资源能力显式报错**：`--storage`、`--gpu`、`--npu`、`--network-bandwidth`
   在 CLI 层直接拒绝，不会静默降级。
 - **Android**：`licore boot enable` 尚不生成 Magisk `service.d` 脚本（手动放置可替代）；
@@ -378,7 +385,7 @@ licore boot disable                       # 移除系统服务
 
 ```bash
 CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -o licore-android-arm64 .
-# 需要 exec 功能时改用 NDK cgo 交叉编译（docs/android-root.md 第 2 节）
+# exec 依赖设备上的 nsenter（Android 10+ 由 Toybox 自带）
 ```
 
 有 Root 设备上的适配细节（SELinux 处理与限制、cgroup v1/v2 回退与语义差异、
@@ -399,8 +406,10 @@ CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -o licore-android-arm64 .
 ```bash
 make all            # 默认：linux/amd64 + linux/arm64 + android/arm64
 make linux          # 桌面 Linux（amd64 + arm64）
-make android        # Android arm64；有 NDK 则含 cgo（exec 可用），无则自动降级
-make android-nocgo  # Android arm64 纯 Go（exec 不可用，其余功能正常）
+make android        # Android arm64（Toybox 自带 nsenter，exec 可用）
+make android-arm    # Android ARMv7（旧设备）
+make android-386    # Android x86（模拟器）
+make darwin         # macOS（amd64 + arm64）
 make test           # go test ./...
 make vet            # go vet ./...
 make fmt            # gofmt 检查（有未格式化文件则失败）
@@ -410,51 +419,32 @@ make help           # 列出全部目标
 ```
 
 产物统一落在 `dist/`，形如 `dist/licore-linux-amd64`。版本号可注入：
-`make VERSION=0.7.0 all`。
+`make VERSION=0.8.0 all`。
 
-> 需要 `licore exec` 的 Linux 服务器请自行用 cgo 构建（Makefile 目标是纯 Go，
-> 不含 exec）：
->
-> ```bash
-> CGO_ENABLED=1 go build -ldflags '-X main.version=0.7.0' -o licore .
-> ```
+> 所有目标都是 `CGO_ENABLED=0` 的纯 Go 静态二进制，**不需要任何 C 工具链或 NDK**。
+> 若系统没有 `nsenter`，装一下即可获得 `exec`：`sudo apt install util-linux`。
 
 ### 构建矩阵
 
-`licore exec` 需要 cgo（见下方说明），因此**凡 `CGO_ENABLED=0` 的构建都没有 exec**，
-包括默认的 `make linux`。这一列是实测结论，不是推断：
+全部目标都是纯 Go（`CGO_ENABLED=0`）、静态链接、无交叉编译前置依赖：
 
-| 目标平台 | 命令 | cgo | 交叉编译前置依赖 | `licore exec` |
-| --- | --- | --- | --- | --- |
-| linux/amd64 | `make linux` | 否（纯 Go） | 无 | ❌ 明确报错 |
-| linux/arm64 | `make linux` | 否（纯 Go） | 无 | ❌ 明确报错 |
-| android/arm64 | `make android`（有 NDK） | **是** | Android NDK（`ANDROID_NDK_HOME`） | ✅ |
-| android/arm64 | `make android`（无 NDK，自动降级） | 否 | 无 | ❌ 明确报错 |
-| android/arm64 | `make android-nocgo` | 否（纯 Go） | 无 | ❌ 明确报错 |
-| linux/amd64（本机） | `CGO_ENABLED=1 go build -o licore .` | 是 | 本机 C 工具链 | ✅ |
-| darwin/arm64、linux/386、linux/riscv64 等 | 手动命令 | 否 | 无 | ❌（非 linux 恒为 stub） |
+| 目标平台 | 命令 | 前置依赖 | `licore exec` |
+| --- | --- | --- | --- |
+| linux/amd64、linux/arm64 | `make linux` | 无 | ✅（系统有 nsenter 时） |
+| linux/arm、linux/386、linux/riscv64 | 手动命令 | 无 | ✅（同上） |
+| android/arm64 | `make android` | 无 | ✅（Toybox 自带 nsenter） |
+| darwin/amd64、darwin/arm64 | `make darwin` | 无 | ⚠️ 需 VM 内有 nsenter |
 
-**为什么 exec 要 cgo**：`licore exec` 需要进入容器的挂载命名空间，必须
-`setns(CLONE_NEWNS)`，而纯 Go 无法安全调用（Go issue #9091），因此由可选 cgo 组件
-`internal/execns` 承担。纯 Go 构建下 exec 返回明确的 `ErrNoCgoExec`
-（提示"exec 需要 cgo 构建（CGO_ENABLED=1）"）——**不是"部分可用"，是明确拒绝**，
-其余功能完全正常。需要 exec 就选一个带 cgo 的构建。
+`exec` 是否可用是**运行期**判定，与编译方式无关：`licore exec` 会探测
+`nsenter` → `busybox nsenter`，都没有就返回带安装指引的错误，其余功能不受影响。
 
 ### 交叉编译（不依赖 Makefile）
 
 ```bash
-# 服务器与桌面：无需任何工具链
-CGO_ENABLED=0 GOOS=linux  GOARCH=arm64 go build -tags nocgo_exec -o licore-linux-arm64 .
-CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -tags nocgo_exec -o licore-darwin-arm64 .
-
-# Android 纯 Go（exec 不可用）
-CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -tags nocgo_exec -o licore-android-arm64 .
-
-# Android 含 cgo（exec 可用）：需要 Android NDK
-NDK=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
-CGO_ENABLED=1 GOOS=android GOARCH=arm64 \
-  CC=$NDK/aarch64-linux-android21-clang \
-  go build -o licore-android-arm64 .
+# 全部平台都无需任何工具链
+CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -o licore-linux-arm64 .
+CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o licore-darwin-arm64 .
+CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -o licore-android-arm64 .
 ```
 
 前提：Go **1.27+**（`go.mod` 的 `go` 指令）；Android 侧还需一台已 Root 的设备，

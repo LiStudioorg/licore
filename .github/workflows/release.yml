@@ -4,11 +4,11 @@
 # LiCore 发布流程：推送任意 tag 时构建全部平台二进制、打包、生成校验和、
 # 创建 GitHub Release 并上传资产。
 #
-# 资产设计（11 个 tar.gz）：
-#   - 除 Android 外每个平台一个纯 Go 包（默认，exec 不可用）；
-#   - linux/amd64、linux/arm64、android/arm64 额外提供 cgo 包（exec 可用），
-#     以 -cgo 后缀区分——同 GOOS/GOARCH 出两个包，因为是否支持 exec 是
-#     用户可感知的实质差异；
+# 资产设计（8 个 tar.gz + SHA256SUMS）：
+#   - 每个平台一个包，**全部是纯 Go 静态二进制**（CGO_ENABLED=0）；
+#   - 不再有 -cgo 变体：v0.8.0 起 `licore exec` 改为调用系统的 nsenter
+#     （util-linux / Toybox / busybox 均提供），纯 Go 构建即具备完整 exec 能力，
+#     因此同一个平台只需一个包；
 #   - 每个包内含 licore 二进制 + README.md + LICENSE；
 #   - 另出 SHA256SUMS 供安装脚本校验。
 
@@ -70,71 +70,45 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: 安装 linux/arm64 交叉 cgo 工具链
-        # 提供 licore-linux-arm64-cgo.tar.gz 所需的 aarch64 编译器。
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
-          aarch64-linux-gnu-gcc --version | head -1
-
-      - name: 定位 Android NDK 编译器
-        id: ndk
-        run: |
-          ndk_dir="$(ls -d "${ANDROID_NDK_LATEST_HOME:-}" 2>/dev/null || true)"
-          if [ -z "$ndk_dir" ]; then
-            ndk_dir="$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -1 || true)"
-          fi
-          if [ -z "$ndk_dir" ]; then
-            echo "未找到 Android NDK，无法产出 android cgo 版" >&2
-            exit 1
-          fi
-          cc="$ndk_dir/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
-          if [ ! -x "$cc" ]; then
-            echo "NDK 中找不到编译器：$cc" >&2
-            exit 1
-          fi
-          echo "使用 NDK：$ndk_dir"
-          echo "cc=$cc" >> "$GITHUB_OUTPUT"
-
       - name: 构建全部平台
         env:
           TAG: ${{ github.ref_name }}
-          NDK_CC: ${{ steps.ndk.outputs.cc }}
         run: |
           set -euo pipefail
           # 去掉 tag 的 v 前缀：main.go 的 version 默认是 "0.0.0-dev" 形态，
-          # 输出为 "licore version 0.7.1 (linux/amd64)"，与之一致。
+          # 输出为 "licore version 0.8.0 (linux/amd64)"，与之一致。
           VERSION="${TAG#v}"
           LDFLAGS="-s -w -X main.version=${VERSION}"
           OUT=dist
           mkdir -p "$OUT"
 
-          build_nocgo() { # goos goarch name
+          build() { # goos goarch name
             CGO_ENABLED=0 GOOS="$1" GOARCH="$2" \
-              go build -tags nocgo_exec -ldflags "$LDFLAGS" -o "$OUT/licore-$3" .
-          }
-          build_cgo() { # goos goarch name cc
-            CGO_ENABLED=1 GOOS="$1" GOARCH="$2" CC="$4" \
               go build -ldflags "$LDFLAGS" -o "$OUT/licore-$3" .
           }
 
-          # 纯 Go（默认包）：exec 不可用，其余功能完整。
-          build_nocgo linux   amd64   linux-amd64
-          build_nocgo linux   arm64   linux-arm64
-          build_nocgo linux   arm     linux-arm
-          build_nocgo linux   386     linux-386
-          build_nocgo linux   riscv64 linux-riscv64
-          build_nocgo android arm64   android-arm64
-          build_nocgo darwin  amd64   darwin-amd64
-          build_nocgo darwin  arm64   darwin-arm64
-
-          # cgo（exec 可用）：与同名纯 Go 包以 -cgo 后缀区分。
-          build_cgo linux amd64 linux-amd64-cgo gcc
-          build_cgo linux arm64 linux-arm64-cgo aarch64-linux-gnu-gcc
-          build_cgo android arm64 android-arm64-cgo "$NDK_CC"
+          build linux   amd64   linux-amd64
+          build linux   arm64   linux-arm64
+          build linux   arm     linux-arm
+          build linux   386     linux-386
+          build linux   riscv64 linux-riscv64
+          build android arm64   android-arm64
+          build darwin  amd64   darwin-amd64
+          build darwin  arm64   darwin-arm64
 
           echo "构建产物："
           ls -la "$OUT"
+
+          # 全部产物必须是静态链接——这是去掉 cgo 的核心收益，不能回退。
+          for bin in "$OUT"/licore-*; do
+            if ldd "$bin" 2>&1 | grep -q "not a dynamic executable"; then
+              echo "OK  $(basename "$bin") 静态链接"
+            else
+              echo "FAIL $(basename "$bin") 仍有动态依赖：" >&2
+              ldd "$bin" >&2
+              exit 1
+            fi
+          done
 
       - name: 打包（tar.gz，含 README 与 LICENSE）
         run: |
@@ -219,7 +193,7 @@ jobs:
             echo
             echo "**校验下载**：每个归档都列入 \`SHA256SUMS\`，可用 \`sha256sum -c SHA256SUMS\` 校验。"
             echo
-            echo "**说明**：带 \`-cgo\` 后缀的包支持 \`licore exec\`；不带的是纯 Go 构建，exec 不可用（其余功能完整）。"
+            echo "**说明**：全部包都是纯 Go 静态二进制（无 glibc / 动态库依赖），\`licore exec\` 依赖系统自带或可安装的 \`nsenter\`（util-linux、Toybox、busybox 均提供）。"
           } > /tmp/release-notes.md
           echo "Release notes 预览："
           cat /tmp/release-notes.md

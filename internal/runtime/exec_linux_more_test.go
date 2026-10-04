@@ -6,6 +6,7 @@
 package runtime
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -146,31 +147,6 @@ func TestExecIsolationEnvNotLeaked(t *testing.T) {
 	}
 }
 
-// TestApplyExecUserValidParsing 覆盖 -u 的各种合法/非法形态。
-// 只验证**解析**部分（uid/gid 取值），不真的改变进程身份。
-func TestApplyExecUserParsing(t *testing.T) {
-	bad := []string{
-		"abc", "0:abc", "-1", ":-1", "1:2:3", "  ", "root",
-	}
-	for _, u := range bad {
-		if err := applyExecUser(u); err == nil {
-			// "  " 与 "root" 会因为 Atoi 失败而报错，属预期。
-			t.Errorf("applyExecUser(%q) 应报错", u)
-		}
-	}
-	// 空前缀 "1:2:3" 之类应报错；合法的 "0" 会真的 setuid(0)，
-	// 在当前已是 root 时无副作用，在非 root 时会失败——
-	// 两种情况都不应 panic，这里只断言不 panic。
-	t.Run("no-panic", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r != nil {
-				t.Fatalf("applyExecUser 不应 panic: %v", r)
-			}
-		}()
-		_ = applyExecUser("0")
-	})
-}
-
 // TestIsTerminalDistinguishes 验证 isTerminal 能区分终端与普通文件。
 // 这条断言本身也在守护"必须传有效指针"这一教训：传 nil 会让两者
 // 都返回 false（无从区分），传有效指针才能正确区分。
@@ -216,4 +192,34 @@ func TestDevPtsDirSeamIsUsed(t *testing.T) {
 		t.Fatal("从端路径未走 seam（自定义空目录下不应成功）")
 	}
 	_ = strconv.Itoa(0)
+}
+
+// TestExecNoNsenterKeepsInstallHint 回归：exec 在缺 nsenter 时，报错必须
+// **保留安装指引**，而不能退化成裸哨兵。
+//
+// 背景：Exec 曾在此处预判 execns.Enabled() 并直接返回 fmt.Errorf("%w",
+// ErrNoNsenter)，于是用户只看到 "exec: exec 需要 nsenter"，丢掉了
+// nsenterMissingError 里「sudo apt install util-linux / 装 Magisk、busybox」
+// 这条唯一能指导用户脱困的信息。现在改为把判断交给 Enter，由它产出完整文案。
+//
+// 用一个不带 nsenter 的 PATH 复用真实代码路径；需要 root 才能走到这步以外，
+// 但缺 nsenter 的判断在 root 检查之后、Enter 之前，因此非 root 下会先返回
+// ErrNotRoot，此时跳过（该分支由 root 环境的 CI 任务覆盖）。
+func TestExecNoNsenterKeepsInstallHint(t *testing.T) {
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", t.TempDir()) // 空目录：nsenter 与 busybox 都找不到
+	defer func() { _ = os.Setenv("PATH", origPath) }()
+
+	_, err := Exec(&ExecOptions{TargetPID: os.Getpid(), Cmd: []string{"/bin/true"}})
+	if err == nil {
+		t.Fatal("缺 nsenter 应报错")
+	}
+	if errors.Is(err, ErrNotRoot) {
+		t.Skip("非 root：Exec 在缺 nsenter 判定之前先返回 ErrNotRoot，该分支由 root CI 覆盖")
+	}
+	for _, want := range []string{"util-linux", "Magisk", "busybox"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("缺 nsenter 的报错丢了安装指引，缺少 %q：\n%v", want, err)
+		}
+	}
 }

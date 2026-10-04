@@ -62,7 +62,7 @@ jobs:
         # -race 需要 cgo，ubuntu runner 自带 gcc，无需额外安装。
         run: go test -race ./... -count=1
 
-  # 8 平台纯 Go 交叉编译。--no-cgo 目标统一带 nocgo_exec 标签走 stub。
+  # 8 平台交叉编译。全部是纯 Go（CGO_ENABLED=0），无 cgo / NDK 依赖。
   cross:
     name: 交叉编译 ${{ matrix.goos }}/${{ matrix.goarch }}
     runs-on: ubuntu-latest
@@ -94,55 +94,14 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
-          go build -tags nocgo_exec -o /dev/null .
-
-  # Android cgo 构建：exec 需要它，因此必须单独验证能编过。
-  # NDK 用 runner 预装版本，不写死路径，避免 NDK 版本升级导致 CI 变红。
-  android-cgo:
-    name: Android cgo 构建（exec 可用）
-    runs-on: ubuntu-latest
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 安装 Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
-
-      - name: 定位 NDK 编译器
-        id: ndk
-        run: |
-          # GitHub 的 ubuntu runner 预装 Android SDK/NDK。
-          ndk_dir="$(ls -d "${ANDROID_NDK_LATEST_HOME:-}" 2>/dev/null || true)"
-          if [ -z "$ndk_dir" ]; then
-            ndk_dir="$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -1 || true)"
-          fi
-          if [ -z "$ndk_dir" ]; then
-            echo "未找到 Android NDK，无法验证 cgo 构建" >&2
-            exit 1
-          fi
-          cc="$ndk_dir/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
-          if [ ! -x "$cc" ]; then
-            echo "NDK 中找不到编译器：$cc" >&2
-            exit 1
-          fi
-          echo "使用 NDK：$ndk_dir"
-          echo "cc=$cc" >> "$GITHUB_OUTPUT"
-
-      - name: 构建（CGO_ENABLED=1）
-        env:
-          GOOS: android
-          GOARCH: arm64
-          CGO_ENABLED: "1"
-          CC: ${{ steps.ndk.outputs.cc }}
-        run: |
           go build -o /dev/null .
 
-  # 本机 cgo 构建：确保 internal/execns 在 linux/amd64 上也能编过并跑通测试。
-  linux-cgo:
-    name: Linux cgo 构建（exec 可用）
+  # exec 依赖系统的 nsenter，不再依赖 cgo。这里验证：
+  #   1) internal/execns 的探测与命令构造在真实环境（装了 util-linux）下通过；
+  #   2) 缺 nsenter 时的报错文案可读（用 PATH 隔离模拟）；
+  #   3) 真实 nsenter 能被调用（root 下 setns 自己所在的命名空间）。
+  exec-nsenter:
+    name: exec nsenter 检测（util-linux / busybox）
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
@@ -154,7 +113,27 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: 构建
-        env:
-          CGO_ENABLED: "1"
-        run: go build -o /dev/null .
+      - name: 确认 runner 自带 nsenter
+        run: |
+          nsenter --version
+          command -v busybox && busybox nsenter --help | head -3 || echo "runner 无 busybox（后备路径仅单测覆盖）"
+
+      - name: 运行 execns 测试
+        run: go test ./internal/execns/ -count=1 -v
+
+      - name: 真实 setns 冒烟（需要 root）
+        run: |
+          sudo --preserve-env=PATH,GOCACHE,GOMODCACHE,GOPATH,HOME \
+            "$(command -v go)" test ./internal/execns/ -run TestRealNsenterIfPresent -count=1 -v
+
+      - name: 纯 Go 二进制必须是静态链接（无 glibc 依赖）
+        run: |
+          CGO_ENABLED=0 go build -o /tmp/licore .
+          file /tmp/licore
+          if ldd /tmp/licore 2>&1 | grep -q "not a dynamic executable"; then
+            echo "OK：静态链接，无动态依赖"
+          else
+            echo "FAIL：二进制不是静态链接，仍依赖动态库" >&2
+            ldd /tmp/licore
+            exit 1
+          fi

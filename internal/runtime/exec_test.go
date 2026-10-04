@@ -16,16 +16,3 @@ func TestExecOptionsValidate(t *testing.T) {
 		t.Error("含 NUL 参数应报错")
 	}
 }
-
-// TestApplyExecUserBad 验证非法 uid/gid 格式在解析阶段即报错，不触摸系统调用。
-func TestApplyExecUserBad(t *testing.T) {
-	for _, bad := range []string{"abc", ":2", "abc:2", "1:xyz"} {
-		if err := applyExecUser(bad); err == nil {
-			t.Fatalf("applyExecUser(%q) 应报错", bad)
-		}
-	}
-	// 空串为合法（保持当前身份）。
-	if err := applyExecUser(""); err != nil {
-		t.Fatalf("applyExecUser(\"\") 不应报错: %v", err)
-	}
-}

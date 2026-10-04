@@ -31,7 +31,7 @@ fi
 
 # —— 1. 构建演示二进制（注入版本号与正式发布一致）——
 mkdir -p "$D/bin" "$D/ctx/bin" "$D/ctx/www" "$D/home/boot" "$D/build-home"
-( cd "$SRC" && CGO_ENABLED=1 go build -ldflags "-s -w -X main.version=$(git -C "$SRC" describe --tags --abbrev=0 2>/dev/null || echo dev)" -o "$D/bin/licore" . )
+( cd "$SRC" && CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=$(git -C "$SRC" describe --tags --abbrev=0 2>/dev/null || echo dev)" -o "$D/bin/licore" . )
 ln -sf "$D/bin/licore" /usr/local/bin/licore 2>/dev/null \
     || sudo -n ln -sf "$D/bin/licore" /usr/local/bin/licore   # Require licore 能在录制 PATH 里命中演示二进制
 

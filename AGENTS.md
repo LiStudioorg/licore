@@ -59,7 +59,7 @@ tag 并推送。tag 应当是一次性的发布动作，而不是可以事后修
 
 ## 核心约定
 
-- **语言**：Go，纯 Go，**不使用 CGO**（`CGO_ENABLED=0`）。**唯一例外**：`internal/execns` 的 setns 进入容器挂载命名空间必须用 cgo（纯 Go 无法 setns(CLONE_NEWNS)，见 Go issue #9091）；该组件为可选构建（`-tags nocgo_exec` 走 stub），其余所有代码保持纯 Go。
+- **语言**：Go，**纯 Go，全仓库零 CGO**（`CGO_ENABLED=0` 即可完整构建）。进入容器挂载命名空间这一步改由系统的 `nsenter` 承担（见《exec 与 nsenter》），因此**没有任何 cgo 例外**，也不再有 `-tags nocgo_exec` 构建变体。
 - **模块路径**：`github.com/LiStudioorg/licore`。
 - **可执行文件**：`licore`；`main.go` 位于项目根目录，便于在根目录直接 `go build`。
 - **镜像后缀**：`.licore`。
@@ -96,7 +96,7 @@ licore/
 │   ├── dev/             # 开发工具：文件监听、热重载
 │   ├── doctor/          # 环境自检：内核/namespace/cgroup/systemd/存储
 │   ├── scaffold/        # 项目脚手架：boxfile/compose 模板与 lint
-│   └── execns/          # 可选 cgo 组件：exec 进入容器 mnt/uts/ipc/net/pid 命名空间
+│   └── execns/          # 纯 Go：探测并调用系统 nsenter，进入容器 mnt/uts/ipc/net/pid 命名空间
 ├── pkg/
 │   └── sdk/             # 对外 Go SDK，供第三方以库方式驱动 LiCore
 ├── docs/
@@ -231,12 +231,52 @@ licore shutdown       由系统服务停止时调用，优雅停止自启容器
 1. **禁止**引入任何第三方容器组件 / 容器库（Docker、containerd、runc、buildkit、OCI 相关库、cgroups 库等）——容器生态完全自研。
 2. **禁止**做任何形式的 Docker / OCI 兼容（不做镜像格式转换、不实现Distribution API），LiCore 只认 `.licore`。
 3. **Android 无 Root 官方不支持**（见《Android 支持策略》）：不得引入/检测 proot 或 Termux、不得引导用户提权，也不得尝试任何用户态隔离方案冒充真隔离。
-4. **禁止** CGO。**唯一例外**为 `internal/execns`（进入容器挂载命名空间必须用 cgo，纯 Go 无法
-   `setns(CLONE_NEWNS)`，见 Go issue #9091）：该包必须同时提供 `-tags nocgo_exec` 与 `!linux`
-   的纯 Go stub，`CGO_ENABLED=0` 时自动走 stub，其余所有包继续禁止 CGO。新增任何 cgo 代码
-   必须先改本节。
+4. **禁止** CGO——**无任何例外**。全仓库必须 `CGO_ENABLED=0` 可构建，产物为静态二进制。
+   需要与内核/命名空间交互而纯 Go 做不到的，一律通过调用**系统外部程序**解决
+   （当前唯一一例是 `internal/execns` 调 `nsenter`，见《exec 与 nsenter》）。
+   新增任何 cgo 代码必须先改本节并获得批准。
 5. **禁止**在运行时引入常驻守护进程设计（引擎以单二进制按需执行为目标，服务化另立 RFC）。
 6. **禁止**未经文档约定就新增顶层目录或改变 `pkg/sdk` 公开 API。
+
+## exec 与 nsenter
+
+`licore exec` 需要进入容器的 mount / uts / ipc / net / pid 命名空间，而纯 Go
+**无法**可靠调用 `setns(CLONE_NEWNS)`（Go runtime 是多线程的，setns 要求调用线程
+不与其它线程共享 `CLONE_FS`，见 Go issue #9091）。
+
+LiCore 的解法：把「进入命名空间」这一步交给系统的 **`nsenter`**
+（`internal/execns` 只负责探测与构造命令行）。
+
+### 为什么是外部程序而不是 cgo
+
+v0.7.x 及以前用自研 cgo 组件 fork 单线程子进程来完成 setns。v0.8.0 起改为
+调用 `nsenter`，原因：
+
+- **二进制保持纯 Go**：`CGO_ENABLED=0` 即可完整构建，静态链接、无 glibc 依赖，
+  不再需要 C 工具链或 Android NDK；
+- **构建矩阵简化**：不再有「纯 Go 版没有 exec」的分别，同平台只出一个包；
+- **nsenter 已处理 PID namespace 的关键语义**：`setns(CLONE_NEWPID)` 不会把调用者
+  本身移入新 PID namespace，只有之后 fork 出的子进程才是其成员。util-linux 与
+  busybox 的 nsenter **默认都会在 setns 之后 fork**，正好满足这一点（自研 cgo 版
+  为此写了两段 fork）。
+
+### 探测顺序与命令构造（实现约束）
+
+- 探测：`nsenter` → `busybox nsenter`（Magisk / 精简 Android 常见）→ 都没有则
+  返回 `ErrNoNsenter` 并附带安装指引。
+- **必须用短选项** `-t/-m/-u/-i/-n/-p`：busybox 的 nsenter **不支持任何长选项**
+  （`--target` 会直接报错），长选项虽在 util-linux 上更可读却不可移植。
+- **工作目录必须写成紧贴形式 `-w<dir>`**：`-w` 的参数在 util-linux 与 busybox 上
+  都是「可选」的，写成 `-w` `/app` 会把 `/app` 当成要执行的命令。
+- `-S/-G`（uid/gid）两个实现写法一致，可直接使用；其余用户态处理（伪终端分配、
+  stdio 透传）仍由 Go 侧 `internal/runtime.Exec` 负责。
+- 目标命令前必须加 `--`，否则以 `-` 开头的命令会被 nsenter 当成自己的选项。
+
+### 运行期语义（对用户可见）
+
+`exec` 是否可用取决于**运行环境有没有 nsenter**，与编译方式无关：同一个二进制在
+装了 util-linux 的机器上可用，反之返回明确错误。macOS / Windows 上不可用（需在
+VM / WSL2 内运行，由 VM 里的 nsenter 提供）。
 
 ## 常用命令
 
@@ -282,7 +322,7 @@ CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o licore-darwin-arm64 .
 - **cgroup 限额真正生效**：cgroups v2 下 `cgroup.subtree_control` 未开启 `cpu memory pids`
   时子组限额文件不可写、写入被静默忽略；现由 `internal/resource` 在 `Setup` 前显式开启控制器。
 - **`licore exec` 真正进入全部命名空间**：纯 Go 无法 `setns(CLONE_NEWNS)`（Go issue #9091），
-  改由可选 cgo 组件 `internal/execns` 在单线程子进程中完成 setns + execve；纯 Go 构建走 stub。
+  改由 `internal/execns` 完成（当时是 cgo 组件，v0.8.0 起改为调用系统 `nsenter`，见下）。
 - **卷 `:ro` 真正只读**：bind 挂载后补 `MS_REMOUNT|MS_BIND|MS_RDONLY`，否则 `:ro` 形同虚设。
 - **同名容器并发创建原子化**：名字唯一性从"扫描后创建"（TOCTOU）改为 `O_EXCL` 锁文件；
   `rm` 改走 `RemoveContainer`，避免绕过锁释放导致名字永久泄漏。

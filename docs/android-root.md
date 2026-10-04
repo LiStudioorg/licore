@@ -21,7 +21,7 @@ Android 有 Root 走与 Linux 服务器相同的 `native_linux` 后端：namespa
 | cgroup 资源限制 | ✅ | 优先 cgroup v2，设备只有 v1（或 v1/v2 混合）时自动走 v1 |
 | 网络（veth + NAT） | ✅ | 同 Linux |
 | 卷 / `:ro` / 匿名卷 | ✅ | 同 Linux |
-| `licore exec`（含 `-it`） | ✅ | 走 cgo 组件 `internal/execns`；**纯 Go 构建下 exec 不可用**，见 3.2 |
+| `licore exec`（含 `-it`） | ✅ | 依赖设备的 `nsenter`；Android 10+ 由 Toybox 自带，见 3.2 |
 | 开机自启 | ❌ 未实现 | 设计为 Magisk `service.d`，`internal/service` 的 Android 后端尚未落地（见第 8 节） |
 | SELinux | ⚠️ 见第 2 节 | enforcing 设备上存在策略限制，无法完全消除 |
 
@@ -36,11 +36,8 @@ Android 有 Root 走与 Linux 服务器相同的 `native_linux` 后端：namespa
 ```bash
 cd licore
 CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -o licore-android-arm64 .
-# ⚠️ 纯 Go 构建没有 `licore exec`（setns 进挂载命名空间必须 cgo，见 3.2）。
-# 需要 exec 时在 NDK 环境交叉编译：
-CGO_ENABLED=1 GOOS=android GOARCH=arm64 \
-  CC=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang \
-  go build -o licore-android-arm64 .
+# 无需 NDK、无需 C 工具链：产物是静态链接的纯 Go 二进制，exec 能力完整。
+# `licore exec` 依赖设备上的 nsenter（见 3.2）。
 ```
 
 **② 推送到设备**：
@@ -110,18 +107,29 @@ adb shell su -c 'LICORE_HOME=/data/licore /data/local/bin/licore ps'
 探测方式是只读的（`/proc/self/ns` 目录项 + `/proc/sys/user/max_user_namespaces`），
 任何情况下都不会为了"看看行不行"去真的创建命名空间。
 
-### 3.2 纯 Go 构建在 Android 上的实际形态（诚实声明）
+### 3.2 `licore exec` 在 Android 上依赖 nsenter
 
-`GOOS=android` 官方交叉编译是 `CGO_ENABLED=0`，此时 `internal/execns` 退化为
-stub（AGPL 头注释与 AGENTS.md 均登记了这唯一 CGO 例外）：
+二进制**始终是纯 Go**（`CGO_ENABLED=0`，静态链接、无需 NDK）。`exec` 需要进入容器的
+**挂载**命名空间，即 `setns(CLONE_NEWNS)`；纯 Go 无法安全调用（线程会在 syscall 间迁移，
+Go issue #9091），因此这一步交给系统的 `nsenter`：
 
-| 功能 | cgo 构建 | 纯 Go / nocgo_exec 构建 |
+| 功能 | Android 10+ | Android 9 及以下 |
 | --- | --- | --- |
 | 容器创建/运行/停止/资源限制 | ✅ | ✅ |
-| `licore exec` 进入容器 | ✅ | ❌ 返回 `ErrNoCgoExec`（不是"部分可用"，是明确拒绝） |
+| `licore exec` 进入容器 | ✅ Toybox 自带 `nsenter` | ⚠️ 部分设备没有，需装 busybox |
 
-原因：进入容器**挂载**命名空间必须 `setns(CLONE_NEWNS)`，纯 Go 无法安全调用
-（线程会在 syscall 间迁移，Go issue #9091）。这不是 Android 特有限制，Linux 服务器相同。
+`internal/execns` 的探测顺序：`nsenter` → `busybox nsenter`。都没有时返回
+`ErrNoNsenter`，并给出安装指引（Magisk 或 busybox）；**其余功能完全不受影响**。
+
+装 busybox 后即自动走 `busybox nsenter` 后备，无需额外配置：
+
+```bash
+# Magisk 环境通常已内置 busybox
+which busybox || magisk --install-module busybox  # 或用 Magisk 模块商店安装
+busybox nsenter --help | head -1                  # 确认可用
+```
+
+这不是 Android 特有的限制，Linux 服务器同理（只是 util-linux 标配了 nsenter）。
 
 ### 3.3 为什么 root 下**不加** user namespace 是正常路径
 
@@ -366,7 +374,7 @@ LiCore 先解析**宿主** `/proc/self/mountinfo` 判断现状：
 | 无 Root 的 Android | **不支持** | 官方策略，见开头 |
 | enforcing 下的策略拦截 | **无法消除** | LiCore 不改策略；见第 4.4 节 |
 | enforcing 真机实测 | **未验证** | 无 SELinux 测试机；见第 4.6 节 |
-| 纯 Go（交叉编译）构建无 `exec` | **设计如此** | setns(CLONE_NEWNS) 必须 cgo；见 3.2 |
+| `exec` 报「需要 nsenter」 | 环境缺 nsenter | Android 10+ 由 Toybox 自带；更早版本装 busybox；见 3.2 |
 | 开机自启（Magisk） | **未实现** | 手动 service.d 脚本可替代；见第 2 节与第 8 节 |
 | 无 cgroup 的设备 | 可运行但无限制 | 明确告警，不假装成功 |
 | user namespace 不可用 | 对 root 路线无影响 | root 本就不加 userns（3.3），非 root 才受影响 |

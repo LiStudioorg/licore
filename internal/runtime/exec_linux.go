@@ -33,8 +33,11 @@ const (
 // 128+signum）。需要 root（CAP_SYS_ADMIN）以 setns 进入他人命名空间。
 //
 // setns(mount namespace) 在纯 Go 下会失败（Go issue #9091），因此进入容器
-// 命名空间由 internal/execns 完成：cgo 构建时用 fork 出的 C 单线程子进程
-// setns+exec；无 cgo 构建返回 ErrNoCgoExec。
+// 命名空间由 internal/execns 交给系统的 nsenter 完成（util-linux / Toybox /
+// busybox 均可）。本包不再依赖 cgo，CGO_ENABLED=0 即可获得完整 exec 能力。
+//
+// 伪终端分配、stdio 透传仍在本函数内完成（nsenter 不管 pty），工作目录与
+// uid/gid 也由 Go 侧在 exec 前处理。
 func Exec(o *ExecOptions) (int, error) {
 	if err := o.validate(); err != nil {
 		return -1, err
@@ -45,9 +48,10 @@ func Exec(o *ExecOptions) (int, error) {
 	if os.Geteuid() != 0 {
 		return -1, ErrNotRoot
 	}
-	if !execns.Enabled() {
-		return -1, fmt.Errorf("exec: %w", execns.ErrNoCgoExec)
-	}
+	// 这里刻意**不**预判 execns.Enabled()：直接交给 Enter 报错，才能拿到
+	// 完整的安装指引（nsenterMissingError 带 apt/yum 与 Magisk/busybox 提示）。
+	// 若在此处用裸哨兵提前返回，用户只会看到 "exec: exec 需要 nsenter"，
+	// 丢失「该怎么装」这条最有用的信息。
 
 	// 决定三个 stdio fd。
 	stdin := firstNonNil(o.Stdin, os.Stdin)
@@ -96,39 +100,14 @@ func (o *ExecOptions) validate() error {
 	return nil
 }
 
-// applyExecUser 解析 "uid[:gid]" 并 setgroups/setgid/setuid。
-func applyExecUser(user string) error {
-	if user == "" {
-		return nil
-	}
-	uidStr, gidStr, _ := strings.Cut(user, ":")
-	uid, err := strconv.Atoi(uidStr)
-	if err != nil || uid < 0 {
-		return fmt.Errorf("exec: 非法用户 %q（应为数字 uid[:gid]）: %w", user, ErrBadConfig)
-	}
-	gid := -1
-	if gidStr != "" {
-		v, err := strconv.Atoi(gidStr)
-		if err != nil || v < 0 {
-			return fmt.Errorf("exec: 非法 gid %q: %w", gidStr, ErrBadConfig)
-		}
-		gid = v
-	}
-	if os.Geteuid() == 0 {
-		if err := syscall.Setgroups([]int{}); err != nil {
-			return fmt.Errorf("exec: setgroups: %w", err)
-		}
-	}
-	if gid >= 0 {
-		if err := syscall.Setgid(gid); err != nil {
-			return fmt.Errorf("exec: setgid %d: %w", gid, err)
-		}
-	}
-	if err := syscall.Setuid(uid); err != nil {
-		return fmt.Errorf("exec: setuid %d: %w", uid, err)
-	}
-	return nil
-}
+// 关于 -u/--user：**不在 Go 侧 setuid**。
+//
+// 曾经的 applyExecUser 在这里做 setgroups/setgid/setuid，nsenter 改造后已删除。
+// 原因是它在新的执行模型下必然失效：Exec 需要先以 root 启动 nsenter 才能
+// setns 进入容器命名空间，而 setuid 一旦发生就永久失去 CAP_SYS_ADMIN，
+// 后续 setns 会直接 EPERM。因此 uid/gid 改由 nsenter 的 -S/-G 承担
+// （见 internal/execns.insertUserFlags）——那两个开关是在**进入命名空间之后**
+// 才生效的，语义才正确。此注释刻意保留，避免后来者"顺手"把 setuid 加回来。
 
 // devPtmxPath / devPtsDir 是 pty 相关路径，做成变量以便测试注入。
 //
