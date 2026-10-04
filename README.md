@@ -1,5 +1,12 @@
 # LiCore
 
+> ⚠️ **安全警告（重要）**：**v0.8.0 之前的版本，容器没有 capability 隔离**——
+> 在 root 下运行时（Linux 服务器默认形态），容器内进程即宿主 root 且持有**全部**
+> capability，既没有 cap-drop，也没有 seccomp / AppArmor。这意味着容器内可以
+> `echo b > /proc/sysrq-trigger` 直接重启宿主、可加载 eBPF、可改写宿主
+> `/proc/sys`。**在 v0.8.0 发布前，请不要用 LiCore 运行任何不可信镜像。**
+> 修复进展见下方《安全模型》一节。
+
 > 用 Go 编写的轻量级容器引擎：无守护进程，2.3 MiB/容器，覆盖 Linux / Android / macOS；自研 `.licore` 镜像格式，不兼容 OCI。
 
 ![LiCore 演示：导入镜像 → 后台运行 → 端口访问 → exec → 停止删除](docs/demo.gif)
