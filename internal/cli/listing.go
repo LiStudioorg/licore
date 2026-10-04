@@ -19,95 +19,111 @@ import (
 //
 //	licore exec <容器ID|名字> <command...>
 //	licore exec -it myapp /bin/sh
+//	licore exec myapp -w /tmp /bin/sh          # exec 自己的选项写在容器名之后也可以
+//
+// **参数解析刻意不走 cobra**（DisableFlagParsing + parseExecArgs）：exec 的
+// 语义是"容器名之后全是容器命令"，而容器命令自身可能带 -c/--foo 这类横杠开头
+// 的参数。cobra 的两种模式都做不到：
+//
+//   - 默认交错解析：容器命令的 -c 会被当成 licore 的 flag，报 unknown shorthand flag；
+//   - SetInterspersed(false)：遇到容器名就停止解析，于是
+//     `exec 容器 -w /tmp cmd` 里的 -w 被当成容器命令（本仓库真机踩过）。
+//
+// 手工扫描的规则见 parseExecArgs；这也与隐藏命令 exec-setup 的
+// DisableFlagParsing 保持一致。
 func newExecCommand(out io.Writer) *cobra.Command {
-	var opts struct {
-		interactive bool
-		tty         bool
-		user        string
-		workdir     string
-		env         []string
-		dataDir     string
-		capDrop     []string
-		capAdd      []string
-	}
 	cmd := &cobra.Command{
 		Use:   "exec [flags] <容器ID|名字> <command...>",
 		Short: "在运行中的容器里执行命令",
-		Args:  cobra.MinimumNArgs(2),
+		Long: "在运行中的容器里执行命令。\n\n" +
+			"容器名之后的内容一律作为容器内命令原样传入，不再解析为 licore 的选项；\n" +
+			"exec 自己的选项写在容器名之前或之后都可以。\n\n" +
+			"  licore exec myapp /bin/sh -c 'echo hi'     # -c 属于容器内命令\n" +
+			"  licore exec myapp -w /tmp /bin/sh          # -w 属于 exec 自己\n" +
+			"  licore exec -it myapp /bin/sh              # 交互式 TTY",
+		DisableFlagParsing: true,
+		// 参数由 parseExecArgs 自己校验，这里不做 cobra 侧校验。
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// 安全边界：exec 只能进一步收紧能力，不允许放宽。
-			// 否则任何能跑 licore exec 的人都能加回 CAP_SYS_ADMIN，
-			// 容器 init 的收口就完全白做了。
-			if err := rejectCapAddForExec(opts.capAdd); err != nil {
-				return err
-			}
-			if err := validateCapSpecs(opts.capDrop, nil); err != nil {
-				return err
-			}
-			st, err := store.Open(opts.dataDir)
+			opts, err := parseExecArgs(args)
 			if err != nil {
 				return err
 			}
-			cfg, err := st.FindContainer(args[0])
-			if err != nil {
-				return err
-			}
-			state, _, err := st.ReadRuntimeState(cfg.ID)
-			if err != nil {
-				return err
-			}
-			if !state.Running || state.InitPID <= 0 {
-				return fmt.Errorf("exec: 容器 %s（%s）未在运行: %w", cfg.Name, cfg.ID, runtime.ErrNotInit)
-			}
-			// 校验运行身份格式（uid[:gid]）。
-			if opts.user != "" {
-				uid, _, _ := strings.Cut(opts.user, ":")
-				if uid == "" {
-					return fmt.Errorf("exec: 非法 --user %q", opts.user)
-				}
-			}
-			// 收口规格经环境变量下发给容器内的 helper：
-			// 默认继承**容器创建时**的 --cap-drop，再叠加本次 exec 的 --cap-drop。
-			// 这些 LICORE_* 变量会被 helper 在 execve 用户命令前剥掉，
-			// 因此不会泄漏进用户命令的环境。
-			env := append(runtime.ExecSetupEnv(cfg.CapDrop, opts.capDrop), opts.env...)
-			code, err := runtime.Exec(&runtime.ExecOptions{
-				TargetPID: state.InitPID,
-				Cmd:       args[1:],
-				Env:       env,
-				Workdir:   opts.workdir,
-				User:      opts.user,
-				TTY:       opts.tty,
-			})
-			if err != nil {
-				if errors.Is(err, runtime.ErrNotRoot) {
-					return fmt.Errorf("exec: 需要 root（setns 进入他人命名空间）: %w", err)
-				}
-				return err
-			}
-			if code != 0 {
-				return &exitCodeError{code: code}
-			}
-			return nil
+			return runExec(cmd, out, opts)
 		},
 	}
-	cmd.Flags().BoolVarP(&opts.interactive, "interactive", "i", false, "保持 stdin 打开")
-	cmd.Flags().BoolVarP(&opts.tty, "tty", "t", false, "分配伪终端")
-	cmd.Flags().StringVarP(&opts.user, "user", "u", "", "运行用户 uid[:gid]")
-	cmd.Flags().StringVarP(&opts.workdir, "workdir", "w", "", "工作目录（容器内路径）")
-	cmd.Flags().StringArrayVarP(&opts.env, "env", "e", nil, "环境变量 KEY=VALUE，可重复")
-	cmd.Flags().StringVar(&opts.dataDir, "data-dir", "", "数据目录（默认 $LICORE_HOME 或 ~/.licore）")
-	cmd.Flags().StringSliceVar(&opts.capDrop, "cap-drop", nil,
+	// 仍然注册 flag 定义，让 --help 能列出可用选项；实际解析由 parseExecArgs 负责。
+	cmd.Flags().BoolP("interactive", "i", false, "保持 stdin 打开")
+	cmd.Flags().BoolP("tty", "t", false, "分配伪终端")
+	cmd.Flags().StringP("user", "u", "", "运行用户 uid[:gid]")
+	cmd.Flags().StringP("workdir", "w", "", "工作目录（容器内路径）")
+	cmd.Flags().StringArrayP("env", "e", nil, "环境变量 KEY=VALUE，可重复")
+	cmd.Flags().String("data-dir", "", "数据目录（默认 $LICORE_HOME 或 ~/.licore）")
+	cmd.Flags().StringSlice("cap-drop", nil,
 		"在容器已有能力基础上进一步收紧（可重复）；exec **只允许收紧**")
-	cmd.Flags().StringSliceVar(&opts.capAdd, "cap-add", nil,
+	cmd.Flags().StringSlice("cap-add", nil,
 		"（已禁用）exec 不允许放宽能力；该参数会被明确拒绝")
-	// 容器名之后的参数一律原样作为容器内命令，不再解析为 licore 的 flag。
-	//
-	// 与 run 的 SetInterspersed(false) 同一理由：`licore exec c /bin/sh -c "..."`
-	// 里的 -c 是**容器内命令**的选项，不该被 cobra 当成自己的。不加这一行时
-	// 会报 `unknown shorthand flag: 'c' in -c`，用户只能被迫加 `--`。
-	//
-	// 代价与 Docker 一致：exec 自己的 flag 必须写在容器名之前。
-	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// runExec 执行已经解析好的 exec 请求。
+func runExec(cmd *cobra.Command, out io.Writer, opts *execArgs) error {
+	// --help 由 parseExecArgs 识别后在这里转成帮助输出：
+	// exec 用 DisableFlagParsing，cobra 不会自己处理它。
+	if opts.wantHelp {
+		return cmd.Help()
+	}
+	// 安全边界：exec 只能进一步收紧能力，不允许放宽。
+	// 否则任何能跑 licore exec 的人都能加回 CAP_SYS_ADMIN，
+	// 容器 init 的收口就完全白做了。
+	if err := rejectCapAddForExec(opts.CapAdd); err != nil {
+		return err
+	}
+	if err := validateCapSpecs(opts.CapDrop, nil); err != nil {
+		return err
+	}
+	st, err := store.Open(opts.DataDir)
+	if err != nil {
+		return err
+	}
+	cfg, err := st.FindContainer(opts.Container)
+	if err != nil {
+		return err
+	}
+	state, _, err := st.ReadRuntimeState(cfg.ID)
+	if err != nil {
+		return err
+	}
+	if !state.Running || state.InitPID <= 0 {
+		return fmt.Errorf("exec: 容器 %s（%s）未在运行: %w", cfg.Name, cfg.ID, runtime.ErrNotInit)
+	}
+	// 校验运行身份格式（uid[:gid]）。
+	if opts.User != "" {
+		uid, _, _ := strings.Cut(opts.User, ":")
+		if uid == "" {
+			return fmt.Errorf("exec: 非法 --user %q", opts.User)
+		}
+	}
+	// 收口规格经环境变量下发给容器内的 helper：
+	// 默认继承**容器创建时**的 --cap-drop，再叠加本次 exec 的 --cap-drop。
+	// 这些 LICORE_* 变量会被 helper 在 execve 用户命令前剥掉，
+	// 因此不会泄漏进用户命令的环境。
+	env := append(runtime.ExecSetupEnv(cfg.CapDrop, opts.CapDrop), opts.Env...)
+	code, err := runtime.Exec(&runtime.ExecOptions{
+		TargetPID: state.InitPID,
+		Cmd:       opts.Cmd,
+		Env:       env,
+		Workdir:   opts.Workdir,
+		User:      opts.User,
+		TTY:       opts.TTY,
+	})
+	if err != nil {
+		if errors.Is(err, runtime.ErrNotRoot) {
+			return fmt.Errorf("exec: 需要 root（setns 进入他人命名空间）: %w", err)
+		}
+		return err
+	}
+	if code != 0 {
+		return &exitCodeError{code: code}
+	}
+	return nil
 }
