@@ -380,10 +380,24 @@ func executeContainerCmd(cmdline, env []string) error {
 	if err := installSeccompFilter(); err != nil {
 		return fmt.Errorf("安装 seccomp 过滤器失败: %w", err)
 	}
-	// 4. SELinux 的 attr/exec 只对本进程的**下一次** execve 生效，必须紧邻 execve。
+	// 4. 解析命令路径。
+	//
+	// execve 是内核系统调用，**从不做 PATH 查找**——直接执行裸命令名
+	// （如 `licore run img sleep 3600`）会得到 ENOENT，即使容器里存在
+	// /bin/sleep。Docker 靠 runc 在 exec 前做 LookPath，这里必须做同样的事。
+	//
+	// 必须在收口之后：此时的 PATH 来自容器 env（已剥掉 LICORE_*），
+	// 且查找是在容器 mount namespace 视图内进行的。
+	execPath, err := resolveContainerCmd(cmdline, env)
+	if err != nil {
+		return err
+	}
+	// 5. SELinux 的 attr/exec 只对本进程的**下一次** execve 生效，必须紧邻 execve。
 	inheritSELinuxContext()
-	if err := syscall.Exec(cmdline[0], cmdline, env); err != nil {
-		return fmt.Errorf("exec %s: %w", cmdline[0], err)
+	// 注意：execve 用解析后的路径，但 argv[0] 保持原样——
+	// 程序通过 argv[0] 看到的仍是用户写的命令名（与 shell 行为一致）。
+	if err := syscall.Exec(execPath, cmdline, env); err != nil {
+		return fmt.Errorf("exec %s: %w", execPath, err)
 	}
 	return nil // 不可达
 }
