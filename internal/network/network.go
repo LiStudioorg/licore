@@ -104,6 +104,59 @@ type Network struct {
 	CreatedAt string `json:"createdAt"`
 	// Endpoints 是当前接入的容器端点。
 	Endpoints []*Endpoint `json:"endpoints,omitempty"`
+
+	// NATBackend 记录 NAT 规则写进了哪个后端（"nft" / "iptables"），
+	// 供清理时用**同一个**后端移除规则——两个后端的规则互不相通，
+	// 用错后端会留下残余规则（真机验证专门检查了这一点）。
+	//
+	// **必须持久化**：清理路径（`licore stop` / `rm` / Disconnect）都经
+	// `Load` 从 state.json 重新读出网络定义，内存里的字段活不到那一刻。
+	// 若不落盘，iptables 回退写下的规则永远不会被清掉。
+	//
+	// 空值（旧版本写的 state.json）按 nft 处理——那是 v0.9.3 之前唯一的
+	// 写入位置。omitempty 保证旧版本读新配置不失败。
+	NATBackend string `json:"natBackend,omitempty"`
+}
+
+// natBackendKind 标识 NAT 规则写在哪个后端。
+type natBackendKind int
+
+const (
+	// natBackendNone 表示尚未应用过 NAT（旧 state.json 的默认值）。
+	natBackendNone natBackendKind = iota
+	// natBackendNft 表示规则写在 nft（`ip licore` 表）。
+	natBackendNft
+	// natBackendIptables 表示规则写在 iptables（`LICORE` 自定义链）。
+	natBackendIptables
+)
+
+// String 便于日志与测试断言。
+func (k natBackendKind) String() string {
+	switch k {
+	case natBackendNft:
+		return "nft"
+	case natBackendIptables:
+		return "iptables"
+	default:
+		return "none"
+	}
+}
+
+// natBackendFromString 由持久化字符串还原后端类型。
+func natBackendFromString(s string) natBackendKind {
+	switch s {
+	case "nft":
+		return natBackendNft
+	case "iptables":
+		return natBackendIptables
+	default:
+		return natBackendNone
+	}
+}
+
+// backend 返回本次应使用的 NAT 后端（由持久化字段还原）。
+func (n *Network) backend() natBackendKind {
+	return natBackendFromString(n.NATBackend)
 }
 
 // New 构造一个未持久化的网络定义。

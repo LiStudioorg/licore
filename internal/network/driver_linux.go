@@ -6,6 +6,7 @@
 package network
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -183,12 +184,63 @@ func containsAny(s string, subs ...string) bool {
 }
 
 // applyPortRules 实化出口 MASQUERADE 与全部端口 DNAT。
-// 先 flush 两条链再 add rule：既保证语法正确（add rule），也保证重放幂等
-// （避免 replace 语法错误以及规则重复堆叠）。
+//
+// **后端选择**：nft 优先，失败则回退 iptables。
+//
+// 为什么要有回退：真机实测 Ubuntu 22.04 标准版 nftables 1.0.2 上
+// `masquerade` 语句不可用，而**同一个 nft 的 `dnat` 正常**、**iptables 的
+// `-j MASQUERADE` 也正常**——内核 NAT 能力在，只是 nft 的原生表达式路径
+// 在这台机器上不通。没有回退时容器**完全无法出网**。
+//
+// 保留 nft 优先的理由：新系统（Ubuntu 24.04+）nft 原生支持更好，
+// 且 nft 是 netfilter 的当前主线工具。
+//
+// 回退只在 **ErrNATApply**（工具在、命令失败）时触发；ErrNotRoot 不触发
+// ——权限不足时 iptables 同样会失败，换个工具只是把同一个错误重演一遍。
+//
+// 先 flush 再 add rule：既保证语法正确，也保证重放幂等（避免规则重复堆叠）。
 func (n *Network) applyPortRules() error {
 	if n.Driver != DriverBridge {
 		return nil
 	}
+	// 先试 nft。
+	nftErr := n.applyPortRulesNft()
+	if nftErr == nil {
+		n.NATBackend = natBackendNft.String()
+	} else if errors.Is(nftErr, ErrNotRoot) {
+		// 权限不足：换 iptables 也一样失败（同样需要 CAP_NET_ADMIN），
+		// 直接返回原错误，避免把同一个权限问题重演一遍后给出误导性报错。
+		return nftErr
+	} else if !iptablesAvailable() {
+		return fmt.Errorf("%w；nft 失败原因: %v；iptables 也不可用（未安装），"+
+			"请安装 nftables（推荐，需内核支持 masquerade）或 iptables",
+			ErrBothBackendsFailed, nftErr)
+	} else if iptErr := n.applyPortRulesIptables(); iptErr != nil {
+		return fmt.Errorf("%w；nft 失败: %v；iptables 回退也失败: %w",
+			ErrBothBackendsFailed, nftErr, iptErr)
+	} else {
+		slog.Info("nft 不可用，NAT 已回退到 iptables",
+			slog.String("net", n.Name), slog.Any("nft_err", nftErr))
+		n.NATBackend = natBackendIptables.String()
+	}
+
+	// FORWARD 链：放行容器出网 + 隔离容器→宿主（H2）。
+	//
+	// **独立于 NAT 后端**：NAT 决定"地址怎么改写"，FORWARD 决定"包能不能过"。
+	// 宿主 FORWARD 策略普遍是 DROP（ufw active 时必然如此），缺了这套规则
+	// 容器**完全没有外网**——NAT 写得再对也没用。真机实测：MASQUERADE 已生效
+	// 但 `nc 8.8.8.8 53` 仍超时；临时插一条 `-i licore0 -j ACCEPT` 后立刻恢复。
+	//
+	// 固定用 iptables 实现：本机 nft 的 masquerade 不可用，而 FORWARD 与 NAT
+	// 是两个独立机制，不要求同后端。若两条路径都不可用，上面的 NAT 分支已返回。
+	if err := n.applyForwardRules(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// applyPortRulesNft 是原先的 nft 实现（表 + 三条链 + 规则）。
+func (n *Network) applyPortRulesNft() error {
 	if err := nftCreateTables(); err != nil {
 		return err
 	}
@@ -278,18 +330,46 @@ func (n *Network) flushChains() {
 	_ = runNft("flush", "chain", "ip", "licore", "out_nat")
 }
 
-// deleteAllDnat 清空 pre_nat 链（在重放数据前调用，避免重复规则堆叠）。
+// deleteAllDnat 清空 NAT 规则（在重放数据前调用，避免重复规则堆叠）。
+//
+// **按实际使用的后端清理**：nft 与 iptables 的规则互不相通，用错后端会
+// 留下残余规则。旧网络定义（无 natBackend 字段）默认按 nft 清理——那是
+// v0.9.3 之前唯一可能的写入位置。
 func (n *Network) deleteAllDnat() {
-	n.flushChains()
+	switch n.backend() {
+	case natBackendIptables:
+		iptFlushChains()
+	default:
+		n.flushChains()
+	}
 }
 
 func (n *Network) addDnatRule(e *Endpoint, p *PortMapping) error {
 	return runNft(dnatRuleArgs(e, p)...)
 }
 
-// removePortRules 移除全部 DNAT 规则（简化实现：flush 整链）。
+// removePortRules 移除全部 NAT 与 FORWARD 规则（容器下线 / 网络拆除时调用）。
+//
+// iptables 后端要**彻底拆除**（删跳转 → flush → 删链），而不只是 flush：
+// 留着一条挂在内建链上的空跳转，会让宿主上每次经过该表的报文都多绕一跳，
+// 且下次 run 若改用别的后端就成了孤儿规则。
+//
+// FORWARD 链**无论 NAT 用哪个后端都要拆**：它固定由 iptables 实现，
+// 不带 NATBackend 判断——按 NAT 后端决定是否拆 FORWARD 会漏掉
+// "NAT 走 nft、FORWARD 走 iptables"的混合场景（本机的实际形态）。
 func (n *Network) removePortRules(veth string) error {
 	_ = veth
+	// 先拆 FORWARD（与 NAT 后端无关）。
+	if err := n.removeForwardRules(); err != nil {
+		slog.Debug("拆除 FORWARD 链失败（可能本就不存在）", slog.Any("err", err))
+	}
+	if n.backend() == natBackendIptables {
+		// 失败不阻断：可能是链本就不存在（幂等）。
+		if err := iptTeardown(); err != nil {
+			slog.Debug("拆除 iptables NAT 链失败（可能本就不存在）", slog.Any("err", err))
+		}
+		return nil
+	}
 	n.deleteAllDnat()
 	return nil
 }

@@ -440,14 +440,27 @@ func (m *Manager) ReleasePorts(netName, containerID string) error {
 	return m.Save(n)
 }
 
-// ApplyNAT 把网络的全部端口映射与出口 NAT 实化到 nftables。无 nft 或非
-// root 时返回相应错误，供 `licore run -p` 路径显式处理（而非静默失败）。
+// ApplyNAT 把网络的全部端口映射与出口 NAT 实化到防火墙。无可用工具或非
+// root 时返回相应错误，供 `licore run` 路径显式处理（而非静默失败）。
+//
+// 后端选择：nft 优先，失败回退 iptables（详见 applyPortRules）。实际用了
+// 哪个后端会**落盘到 state.json**——清理路径（stop/rm/Disconnect）都是重新
+// `Load` 出来的新对象，不落盘就拿不到后端类型，iptables 规则将永远残留。
 func (m *Manager) ApplyNAT(netName string) error {
 	n, err := m.Load(netName)
 	if err != nil {
 		return err
 	}
-	return n.applyPortRules()
+	if err := n.applyPortRules(); err != nil {
+		return err
+	}
+	// 落盘后端选择。Save 失败只告警：NAT 此刻已经生效，为此返回错误会让
+	// 用户以为网络没配好。实际影响仅是下次清理可能用错后端，属次要问题。
+	if err := m.Save(n); err != nil {
+		slog.Warn("记录 NAT 后端失败，清理时可能残留规则",
+			slog.String("net", netName), slog.Any("err", err))
+	}
+	return nil
 }
 
 // ClearNAT 清空网络的全部 NAT 规则。
