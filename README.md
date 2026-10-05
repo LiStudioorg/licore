@@ -300,6 +300,24 @@ licore resource update 容器ID --memory 512   # 动态调整运行中容器限�
 
 注：资源限制在无权限或非 Linux 平台下列表应用失败时降级为告警（`slog.Warn`），不阻断容器运行。
 
+### ⚠️ 默认无内存限额（生产环境请显式指定 `--memory`）
+
+**不指定 `--memory` 时容器内存不受限**——这与 Docker 的默认语义一致，但意味着
+**容器可以把内存吃到触发宿主 OOM killer，从而杀死宿主上的其它进程**。
+
+```bash
+licore run myapp:v1                  # ⚠️ 无内存上限，会打 WARN 日志
+licore run --memory 256m myapp:v1    # ✅ 生产环境应当这样写
+```
+
+- `licore run` 未检测到 `--memory` 时会打一条 `slog.Warn` 提示风险；
+- **LiCore 刻意不设默认上限**：擅自加默认值会破坏合法的大内存负载
+  （数据库、编译构建、机器学习训练），因此把决定权留给用户；
+- 同理，`--pids-limit` 默认不设限，容器内 fork 炸弹可打满宿主 PID 表。
+
+这是**有意为之的设计选择**，不是缺陷；但生产部署必须显式限额。
+详见 [docs/escape-audit.md](docs/escape-audit.md) 的 I7 条目。
+
 ## 容器权限隔离
 
 > **当前状态**：v0.8.0 起默认启用下面三层，但**尚未在真机验证过**——
@@ -314,7 +332,7 @@ v0.8.0 之前，容器在 root 下运行时就是**宿主 root 且持有全部 c
 | --- | --- | --- |
 | `PR_SET_NO_NEW_PRIVS` | 始终开启 | 阻止经 execve 提权（setuid / file capabilities） |
 | capability 裁剪 | 丢光后只放回 Docker 默认集（14 项） | 拿掉 `CAP_SYS_ADMIN` / `CAP_NET_ADMIN` / `CAP_SYS_MODULE` 等 |
-| seccomp 黑名单 | 31 条危险系统调用返回 `EPERM` | 纵深防御第二层：`reboot` / `init_module` / `ptrace` / `unshare` / `mount` / `clone(CLONE_NEWUSER)` 等 |
+| seccomp 黑名单 | 33 条危险系统调用返回 `EPERM`，另 1 条按参数拦截 | 纵深防御第二层：`reboot` / `init_module` / `ptrace` / `unshare` / `mount` / `process_vm_readv` / `kcmp` / `clone(CLONE_NEWUSER)` 等 |
 
 ```bash
 licore run myapp:v1                              # 默认集（与 Docker 默认一致）

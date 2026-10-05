@@ -58,10 +58,20 @@
   同时基础文件操作未被误伤（验证黑名单没有拦太宽）。
   安装过滤器只需 `no_new_privs`，不需要任何 capability，故这一项在沙箱内可验。
 - **未验**：容器内端到端生效（同样受限于无法创建容器）。
-- 已知覆盖缺口（代码注释里也写了）：`bpf`、`userfaultfd`、`kcmp`、
-  `process_vm_readv/writev`、`open_by_handle_at`、`name_to_handle_at`、
-  `kexec_file_load`、`finit_module`、`clock_adjtime` 未列入黑名单——
-  标准库不导出这些 `SYS_*` 常量，手写各架构号的风险高于收益。
+- 已知覆盖缺口（代码注释里也写了）：`bpf`、`userfaultfd`、`open_by_handle_at`、
+  `name_to_handle_at`、`kexec_file_load`、`finit_module`、`clock_adjtime`
+  未列入黑名单；`clone` 只拦 `CLONE_NEWUSER`，未拦 `CLONE_NEWPID/NEWNS/NEWNET`
+  等标志组合——这些调用都需 `CAP_SYS_ADMIN`（已丢）或 `CAP_BPF`/`CAP_SYS_MODULE`
+  等同样已被丢弃的能力，属纵深防御第二层的不完整，而非可直接利用的缺口。
+- **已覆盖（2026-10-05 安全专项补齐）**：`process_vm_readv`、`process_vm_writev`、
+  `kcmp` 三者在 v0.9.0 时仍属缺口，现已加入黑名单。编号按架构分文件
+  （`seccomp_vmproc_*_linux.go`）：arm64/riscv64 复用 `syscall.SYS_*`，
+  x86 与 arm32 因标准库不导出而手写（x86 的 309/310/311 已用运行时实测校验）。
+  补这三条的理由：`ptrace` 有无条件兜底，而这三条原先没有——用户一旦
+  `--cap-add SYS_PTRACE`，它们会立刻失去唯一防护。
+  回归测试：`internal/runtime/seccomp_vmproc_linux_test.go`。
+  **仍未真机验证**（沙箱内无容器），因此本条从"缺口"变为"已实现但未真机验证"。
+
 
 ### 建议的顺手验证（首次跑容器时，约 10 秒）
 

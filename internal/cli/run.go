@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
@@ -80,6 +81,8 @@ func newRunCommand(out io.Writer) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// 未设内存上限时明确告警（实现见 warnIfMemoryUnlimited）。
+			warnIfMemoryUnlimited(opts.memoryMB, args[0])
 
 			st, err := store.Open(opts.dataDir)
 			if err != nil {
@@ -357,6 +360,30 @@ func atoi(s string) int {
 }
 
 // runLimits 把 run 的 CLI 资源参数翻译成 resource.Limits。
+// warnIfMemoryUnlimited 在容器未设置内存上限时打出结构化告警。
+//
+// 为什么必须告警（而不是静默沿用默认值）：没有 cgroup 内存限额的容器可以把
+// 内存吃到触发**宿主 OOM killer**，从而杀死宿主上的其它进程——这是真实的
+// "容器影响宿主机" 路径，不是理论风险。
+//
+// 为什么**不**直接改默认限额：默认不限与 Docker 语义一致，擅自加默认上限会
+// 破坏合法的大内存负载（数据库、构建、机器学习）。因此选择"保持语义 + 明确
+// 告警"，把决定权交回用户（决策记录见 docs/escape-audit.md 的 I7）。
+//
+// memoryMB <= 0 一律视为未限制：0 是 flag 约定的"不限制"，负值同属未设置，
+// 不能因为没走 ==0 分支就静默放过。
+func warnIfMemoryUnlimited(memoryMB int, image string) {
+	if memoryMB > 0 {
+		return
+	}
+	slog.Warn("未设置内存上限，容器可耗尽宿主内存并触发宿主 OOM killer；"+
+		"生产环境请显式指定 --memory",
+		slog.String("image", image),
+		slog.String("suggestion", "--memory 256m"))
+}
+
+// runLimits 把 CLI 的限额参数转成 resource.Limits。
+//
 // 未实现的资源能力（存储配额、GPU/NPU 直通、网络带宽）在此显式拒绝，
 // 不允许"参数接受但运行时假装生效"。
 func runLimits(memoryMB, memorySwapMB, memoryResMB int, cpus float64, pidsLimit int,
