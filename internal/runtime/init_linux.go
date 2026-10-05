@@ -255,6 +255,113 @@ var mountProcRaw = func(target, opts string) error {
 	return syscall.Mount("proc", target, "proc", 0, opts)
 }
 
+// mountProcSysReadOnly 把容器内的 /proc/sys 重挂为只读。
+//
+// **这是封堵两条 P0 宿主逃逸路径的关键**（真机实测，2026-10-05）：
+//
+//	/proc/sys/kernel/core_pattern  写管道 → 崩溃时以宿主 root 执行命令
+//	/proc/sys/kernel/modprobe      写路径 → 劫持内核模块加载
+//
+// 注意 /proc/sysrq-trigger **不在**本函数的覆盖范围内——它在 /proc 根下，
+// 由 maskProcRootFiles 单独处理（实测确认过这个区别）。
+//
+// 为什么 capability/seccomp 都挡不住：容器 init 是真正的宿主 uid 0，
+// /proc/sys 下文件属 root 且模式 0600/0644，DAC 直接放行；而上述文件的
+// 内核 handler 走 proc_dostring，**不做 capable() 检查**，只有 inode 权限。
+// 对照实验：kptr_restrict / drop_caches 走 proc_dointvec_*（内部 capable()），
+// 在同一容器里被正确拒绝——所以问题不是"能力没收干净"，而是这类文件本就
+// 只靠 DAC，而容器恰好在 DAC 上等于宿主 root。
+//
+// 挂载层封堵的好处：open(O_WRONLY) 在 VFS 就被拒，与各内核接口是否做了
+// 能力检查无关，也不需要维护"危险文件清单"（那种清单会随内核版本漂移）。
+//
+// 姿势与 InstallExecHelper / 卷 :ro 一致：先 MS_BIND 再
+// MS_REMOUNT|MS_BIND|MS_RDONLY。**不能**单次
+// mount(MS_BIND|MS_RDONLY)——内核会忽略该次的 MS_RDONLY，bind 仍是可写
+// （v0.6.0 的教训）。
+//
+// 返回错误而非静默跳过：封堵失败意味着容器带着 P0 逃逸路径启动，
+// 必须让启动失败，不能降级。
+func mountProcSysReadOnly(rootfs string) error {
+	target := filepath.Join(rootfs, "proc", "sys")
+	if _, err := os.Stat(target); err != nil {
+		// rootfs 的 /proc 是刚挂上的 procfs，/proc/sys 必然存在；
+		// 走到这里说明 procfs 挂载异常，属真实故障，不能装作没事。
+		return fmt.Errorf("封堵 /proc/sys：%s 不可达（procfs 挂载异常）: %w", target, err)
+	}
+	if err := mountRaw(target, target, "", uintptr(msBind), ""); err != nil {
+		return fmt.Errorf("bind /proc/sys: %w", err)
+	}
+	if err := mountRaw(target, target, "",
+		uintptr(msBind|syscall.MS_REMOUNT|syscall.MS_RDONLY), ""); err != nil {
+		return fmt.Errorf("重挂 /proc/sys 为只读: %w", err)
+	}
+	slog.Debug("已把容器内 /proc/sys 重挂为只读（封堵 core_pattern / " +
+		"modprobe 等宿主逃逸路径）")
+	return nil
+}
+
+// procRootMaskedFiles 是挂在 /proc 根下、**不在 /proc/sys 内**、且能影响
+// 宿主全局状态的 procfs 文件，需要逐个用空只读文件覆盖（mask）。
+//
+// 为什么不能只靠"把 /proc/sys 挂只读"：sysrq-trigger 的路径是
+// /proc/sysrq-trigger —— 它在 /proc 根下，与 /proc/sys/ 目录毫无关系。
+// 真机实测确认过：/proc/sys 重挂只读后，core_pattern 与 modprobe 均被拒，
+// 而 sysrq-trigger 仍能写入（rc=0）。
+//
+// 清单只放**实测确认可写、且能破坏宿主**的项。/proc 根下其余写敏感文件
+// （kmsg / kcore / kpageflags / mtrr 等）实测已被内核拒绝（写模式的文件
+// 返回 EPERM），无需处理——盲目扩大清单会误伤合法用法。
+var procRootMaskedFiles = []string{
+	// 写 'b' 立即重启宿主；写 'c' 触发崩溃转储。这是最直接的一条。
+	"sysrq-trigger",
+}
+
+// maskProcRootFiles 用空只读文件覆盖 /proc 根下的危险文件。
+//
+// 手法与 Docker 的 mask 一致：bind 挂一个"空且只读"的文件到目标路径上，
+// 于是 open(O_WRONLY) 拿到只读文件、write 拿不到任何效果，且不依赖内核
+// 是否为该文件做 capable() 检查。
+//
+// 空文件用 /dev/null 之外的选择更好：/dev/null 可写，覆盖后仍能写入（只是
+// 丢弃）。因此这里在容器内自建一个 0400 的空文件作为源——写入会因只读
+// 挂载与文件权限双重失败。
+//
+// 必须在 /proc 挂好之后、pivot_root 之前调用（与 /proc/sys 同一时机）。
+func maskProcRootFiles(rootfs string) error {
+	// 源文件：放在 rootfs 内，随新根进入容器，不依赖宿主任何路径。
+	src := filepath.Join(rootfs, procMaskDir, "empty")
+	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+		return fmt.Errorf("创建 mask 源目录: %w", err)
+	}
+	if err := os.WriteFile(src, nil, 0o400); err != nil {
+		return fmt.Errorf("创建 mask 源文件: %w", err)
+	}
+
+	for _, name := range procRootMaskedFiles {
+		target := filepath.Join(rootfs, "proc", name)
+		if _, err := os.Stat(target); err != nil {
+			// 内核未提供该文件（如未启用 CONFIG_MAGIC_SYSRQ）——正常，跳过。
+			slog.Debug("procfs 未提供该文件，跳过 mask",
+				slog.String("file", name), slog.Any("err", err))
+			continue
+		}
+		if err := mountRaw(src, target, "", uintptr(msBind), ""); err != nil {
+			return fmt.Errorf("mask /proc/%s（bind）: %w", name, err)
+		}
+		// 与 /proc/sys 同一姿势：先 bind，再 remount 加只读。
+		if err := mountRaw(target, target, "",
+			uintptr(msBind|syscall.MS_REMOUNT|syscall.MS_RDONLY), ""); err != nil {
+			return fmt.Errorf("mask /proc/%s（remount ro）: %w", name, err)
+		}
+		slog.Debug("已 mask 容器内危险 procfs 文件", slog.String("file", "/proc/"+name))
+	}
+	return nil
+}
+
+// procMaskDir 是容器内放置 mask 源文件的目录（在 rootfs 内，随新根进入容器）。
+const procMaskDir = ".licore_mask"
+
 // readHostMountInfo 读取宿主 mountinfo；失败返回空串（调用方按"未设置"处理）。
 func readHostMountInfo() string {
 	data, err := os.ReadFile(hostProcMountInfo)
@@ -586,6 +693,43 @@ func RunInit() error {
 	//    参数按宿主 hidepid 情况决定：宿主为 hidepid=1/2 时显式覆盖为 0，
 	//    否则容器内 ps 看不到自己的进程（Android 有设备默认 hidepid=2）。
 	if err := mountContainerProc(rootfs); err != nil {
+		return err
+	}
+	// 4.5 把 /proc/sys 重挂为只读（必须在 /proc 挂好之后，pivot_root 之前）。
+	//
+	// 为什么必须做（真机实测确认的 P0 逃逸路径，2026-10-05）：
+	// 容器 init 是**真正的宿主 uid 0**（root 下刻意不加 CLONE_NEWUSER，见
+	// nsplan_linux.go 的决策表），而 /proc/sys 下的文件属 root、模式 0600/0644。
+	// 于是 DAC 检查直接通过——**只要该文件自身没有额外的 capable() 检查**，
+	// 容器内就能写穿宿主：
+	//
+	//	容器内：echo b > /proc/sysrq-trigger        → 重启宿主
+	//	容器内：echo X > /proc/sys/kernel/core_pattern → 崩溃时以宿主 root 执行
+	//	容器内：echo X > /proc/sys/kernel/modprobe     → 劫持模块加载路径
+	//
+	// capability 裁剪对这三个**无效**：实测 CapEff 已不含 CAP_SYS_ADMIN，
+	// 而 kptr_restrict / drop_caches（走 proc_dointvec_* ，内部会 capable()）
+	// 被正确拒绝，sysrq-trigger / core_pattern / modprobe（走 proc_dostring，
+	// 只依赖 inode 权限）却能写成功。seccomp 也帮不上——这是 open+write，
+	// 不是专用系统调用。
+	//
+	// 因此唯一可靠的封堵点是**挂载层**：把 /proc/sys 整体 remount 成只读。
+	// 这样连 open(O_WRONLY) 都在 VFS 层被拒，与内核各文件是否有 capable()
+	// 检查无关，不依赖逐文件清单（清单会随内核版本漂移）。
+	//
+	// 与 InstallExecHelper / 卷挂载同一姿势：先 MS_BIND，再
+	// MS_REMOUNT|MS_BIND|MS_RDONLY。单次 mount(MS_BIND|MS_RDONLY) 的
+	// MS_RDONLY 会被内核忽略，bind 仍是可写（v0.6.0 的教训）。
+	if err := mountProcSysReadOnly(rootfs); err != nil {
+		return err
+	}
+	// 4.6 mask /proc 根下的危险文件（sysrq-trigger **不在** /proc/sys 内，
+	//     上一步覆盖不到它）。
+	//
+	//     实测发现（2026-10-05）：/proc/sys 挂只读后，core_pattern 与
+	//     modprobe 已被拒绝，但 /proc/sysrq-trigger 仍能写入（rc=0）——
+	//     因为它的路径在 /proc 根下。写 'b' 会立即重启宿主。
+	if err := maskProcRootFiles(rootfs); err != nil {
 		return err
 	}
 	// 5. pivot_root(".", oldRoot)。注意：不做 chroot——pivot_root 的内核约束是
