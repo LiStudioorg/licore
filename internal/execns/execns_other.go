@@ -27,7 +27,10 @@ var ErrNoCgoExec = ErrUnsupported
 func Enabled() bool { return false }
 
 // Enter 在非 Linux 平台上不可用。
-func Enter(targetPID int, workdir, user string, env []string, inFd, outFd, errFd int, cmd []string) (int, error) {
+//
+// 签名必须与 execns_linux.go 保持一致（含 cgroupDir），否则交叉编译失败。
+// cgroup 归置是 Linux 专有概念，此处忽略该参数。
+func Enter(targetPID int, workdir, user string, env []string, inFd, outFd, errFd int, cmd []string, cgroupDir string) (int, error) {
 	return -1, fmt.Errorf("execns: %w（exec 依赖 Linux 命名空间，macOS 需在 VM 内运行）", ErrUnsupported)
 }
 

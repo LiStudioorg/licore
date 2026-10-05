@@ -16,6 +16,7 @@ import (
 	"unsafe"
 
 	"github.com/LiStudioorg/licore/internal/execns"
+	"github.com/LiStudioorg/licore/internal/resource"
 )
 
 // pty ioctl 常量（syscall 包未导出）。编码：dir<<30 | size<<16 | type<<8 | nr。
@@ -77,8 +78,12 @@ func Exec(o *ExecOptions) (int, error) {
 	// 由容器启动时只读 bind 进 HelperPathInContainer（见 InstallExecHelper）。
 	// 它会在 execve 用户命令之前做 no_new_privs / cap-drop / seccomp——
 	// 否则 exec 出来的进程是宿主 root 满能力，容器 init 的隔离对它无效。
+	//
+	// 同时把 exec 进程放入容器的 cgroup：否则它落在调用者（CLI）自己的
+	// cgroup 里，**完全绕过 --memory / --pids-limit 等资源限额**。
+	cgroupDir := containerCgroupDir(o.CgroupID)
 	pid, err := execns.Enter(o.TargetPID, o.Workdir, o.User, o.Env, inFd, outFd, errFd,
-		o.Cmd, HelperPathInContainer)
+		o.Cmd, HelperPathInContainer, cgroupDir)
 	if err != nil {
 		return -1, err
 	}
@@ -90,6 +95,25 @@ func Exec(o *ExecOptions) (int, error) {
 		return -1, fmt.Errorf("exec: 等待子进程失败")
 	}
 	return code, nil
+}
+
+// containerCgroupDir 由容器 ID 构造 cgroup 目录路径；ID 为空时返回空串
+// （调用方据此跳过 cgroup 归置）。
+//
+// 路径约定与 internal/resource 保持一致：
+//
+//	<CgroupV2Mount>/<LiCoreGroup>/<containerID>
+//	= /sys/fs/cgroup/licore/<id>
+//
+// 刻意复用 resource 的常量而不是硬编码：cgroup 挂载点与一级组名是
+// **跨模块契约**（internal/resource 是写方，本包是读方/使用者），
+// 硬编码会在任一方调整时静默失配——而失配的后果是 exec 悄悄失去限额，
+// 恰恰是本次修复要消除的问题。
+func containerCgroupDir(containerID string) string {
+	if containerID == "" {
+		return ""
+	}
+	return filepath.Join(resource.CgroupV2Mount, resource.LiCoreGroup, containerID)
 }
 
 // validate 检查 exec 选项。

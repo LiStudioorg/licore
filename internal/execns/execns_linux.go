@@ -24,10 +24,13 @@ package execns
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // ErrNoNsenter 表示系统里找不到可用的 nsenter 实现。
@@ -110,7 +113,10 @@ var nsFlags = []string{"-m", "-u", "-i", "-n", "-p"}
 // 为什么必须经 helper：nsenter 进程来自宿主 root，继承**宿主满能力**；
 // 容器 init 里的收口对它无效。不做这一步的话，任何能跑 licore exec 的人
 // 都能拿到宿主 root 的全部能力。
-func Enter(targetPID int, workdir, user string, env []string, inFd, outFd, errFd int, cmd []string, helperPath string) (int, error) {
+//
+// cgroupDir 非空时把新进程放进该 cgroup（容器资源限额据此生效）。
+// 详见 enterWithCgroup 的说明。
+func Enter(targetPID int, workdir, user string, env []string, inFd, outFd, errFd int, cmd []string, helperPath, cgroupDir string) (int, error) {
 	prog := findNsenter()
 	if prog == nil {
 		return -1, nsenterMissingError()
@@ -143,12 +149,101 @@ func Enter(targetPID int, workdir, user string, env []string, inFd, outFd, errFd
 		c.Env = env
 	}
 
+	// **首选路径：clone3(CLONE_INTO_CGROUP)**，让 nsenter 出生即在容器 cgroup。
+	//
+	// 这是唯一**无竞态**的做法：nsenter 会 setns 并 fork 出 helper 与用户命令，
+	// 若等它跑起来再写 cgroup.procs，从 fork 到写入之间产生的子进程会逃脱限额
+	// （写 cgroup.procs 只迁移该进程自身与其线程，**不迁移已存在的子进程**）。
+	// CLONE_INTO_CGROUP 在内核 fork 阶段就完成归置，全部后代天然继承。
+	cgroupFile, err := openCgroupForClone(cgroupDir)
+	if err != nil {
+		return -1, err
+	}
+	if cgroupFile != nil {
+		defer func() { _ = cgroupFile.Close() }()
+		c.SysProcAttr = &syscall.SysProcAttr{
+			UseCgroupFD: true,
+			CgroupFD:    int(cgroupFile.Fd()),
+		}
+	}
+
 	if err := c.Start(); err != nil {
+		// clone3 在本内核/本环境不可用时回退到"启动后迁移"。回退有竞态，
+		// 但比"完全不归置"好得多，且会记 Debug 便于诊断。
+		if cgroupFile != nil && isClone3Unsupported(err) {
+			slog.Debug("clone3(CLONE_INTO_CGROUP) 不可用，回退为启动后迁移 cgroup",
+				slog.String("cgroup", cgroupDir), slog.Any("err", err))
+			c.SysProcAttr = nil
+			if err2 := c.Start(); err2 != nil {
+				return -1, fmt.Errorf("execns: 启动 nsenter 失败: %w", err2)
+			}
+			pid := c.Process.Pid
+			if err3 := movePidToCgroup(pid, cgroupDir); err3 != nil {
+				_ = c.Process.Kill()
+				_, _ = c.Process.Wait()
+				return -1, err3
+			}
+			return pid, nil
+		}
 		return -1, fmt.Errorf("execns: 启动 nsenter 失败: %w", err)
 	}
 	// 不再需要 Go 侧持有的 *os.File 包装：fd 已复制给子进程。
 	// （NewFile 不接管 fd 的所有权语义在此处是刻意的——这些 fd 属于调用方。）
 	return c.Process.Pid, nil
+}
+
+// openCgroupForClone 打开容器 cgroup 目录，供 SysProcAttr.CgroupFD 使用。
+//
+// 返回 (nil, nil) 表示无需归置（cgroupDir 为空），调用方保持旧行为。
+// cgroupDir 非空但目录不存在时返回错误——静默跳过会让 exec 悄悄失去限额，
+// 那正是本修复要消除的状态，不能降级。
+func openCgroupForClone(cgroupDir string) (*os.File, error) {
+	if cgroupDir == "" {
+		return nil, nil
+	}
+	// O_RDONLY 即可：CLONE_INTO_CGROUP 要的是指向 cgroup v2 目录的 fd。
+	// 打开而非仅在 Start 时传路径——fd 在 fork 期间必须保持有效。
+	f, err := os.Open(cgroupDir)
+	if err != nil {
+		return nil, fmt.Errorf("execns: 打开容器 cgroup %s: %w", cgroupDir, err)
+	}
+	return f, nil
+}
+
+// isClone3Unsupported 判断 Start 的失败是否属于"clone3 或 CLONE_INTO_CGROUP
+// 在本内核/本环境不可用"，从而值得回退。
+//
+// 依据：内核不支持 clone3 → ENOSYS；不支持 CLONE_INTO_CGROUP → EINVAL；
+// 被 seccomp 拦 → EPERM。其余错误（如可执行文件不存在 ENOENT）不该回退，
+// 重试只会得到同样的失败。
+func isClone3Unsupported(err error) bool {
+	for _, target := range []error{syscall.ENOSYS, syscall.EINVAL, syscall.EPERM, syscall.EOPNOTSUPP} {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	return false
+}
+
+// movePidToCgroup 把**已经在运行的** pid 加入 cgroupDir 的 cgroup.procs。
+//
+// 这是 clone3 不可用时的**回退路径**（首选路径见 Enter 里的
+// SysProcAttr.CgroupFD + CLONE_INTO_CGROUP）。
+//
+// 回退路径**有竞态**：从进程启动到写入之间，它已在旧 cgroup 里跑了一会儿；
+// 且写 cgroup.procs 只迁移该进程自身与其线程，**不迁移已 fork 的子进程**。
+// 因此回退仅用于 clone3/CLONE_INTO_CGROUP 不可用的环境，并记 Debug 便于诊断。
+func movePidToCgroup(pid int, cgroupDir string) error {
+	procs := filepath.Join(cgroupDir, "cgroup.procs")
+	f, err := os.OpenFile(procs, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("execns: 打开 %s: %w", procs, err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.WriteString(strconv.Itoa(pid)); err != nil {
+		return fmt.Errorf("execns: 把 pid %d 加入 %s: %w", pid, procs, err)
+	}
+	return nil
 }
 
 // buildNsenterArgv 构造完整的 nsenter 命令行。

@@ -77,7 +77,7 @@ func TestFindNsenterNone(t *testing.T) {
 // 安装指引，而不是一句无来由的失败。
 func TestEnterWithoutNsenterReportsInstallHint(t *testing.T) {
 	fakeLookPath(t, map[string]string{})
-	_, err := Enter(1234, "", "", nil, 0, 1, 2, []string{"/bin/sh"}, "")
+	_, err := Enter(1234, "", "", nil, 0, 1, 2, []string{"/bin/sh"}, "", "")
 	if err == nil {
 		t.Fatal("缺 nsenter 应报错")
 	}

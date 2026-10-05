@@ -115,6 +115,10 @@ func runExec(cmd *cobra.Command, out io.Writer, opts *execArgs) error {
 		Workdir:   opts.Workdir,
 		User:      opts.User,
 		TTY:       opts.TTY,
+		// 把 exec 进程放进容器的 cgroup，否则它会落在本 CLI 进程所在的
+		// cgroup（实测 user.slice/...session-N.scope），**绕过 --memory /
+		// --pids-limit 等全部资源限额**。
+		CgroupID: cfg.ID,
 	})
 	if err != nil {
 		if errors.Is(err, runtime.ErrNotRoot) {

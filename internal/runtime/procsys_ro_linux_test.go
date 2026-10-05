@@ -26,6 +26,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/LiStudioorg/licore/internal/resource"
 )
 
 // mkdirAllProcSys 在测试用 rootfs 下造出 proc/sys 目录。
@@ -211,5 +213,34 @@ func TestMaskProcRootFilesFailsLoudly(t *testing.T) {
 
 	if err := maskProcRootFiles(rootfs); err == nil {
 		t.Fatal("mask 失败时必须报错（否则容器带着可写的 sysrq-trigger 启动）")
+	}
+}
+
+// -------- exec 进程的 cgroup 路径构造（v0.9.2） --------
+
+// TestContainerCgroupDirMatchesResourceLayout 断言路径与 internal/resource 一致。
+//
+// 这是**跨模块契约**：internal/resource 是 cgroup 的写方（创建 /licore/<id>
+// 并写 memory.max），execns 是使用者。两边路径一旦不一致，exec 会要么写进
+// 一个不存在的目录（报错），要么悄悄归置到别处（失去限额）。
+func TestContainerCgroupDirMatchesResourceLayout(t *testing.T) {
+	got := containerCgroupDir("abc123")
+	want := resource.CgroupV2Mount + "/" + resource.LiCoreGroup + "/abc123"
+	if got != want {
+		t.Errorf("cgroup 路径 = %q，期望 %q", got, want)
+	}
+	// 钉死字面量，防止常量本身被误改后测试跟着一起"通过"。
+	if want != "/sys/fs/cgroup/licore/abc123" {
+		t.Errorf("路径布局应为 /sys/fs/cgroup/licore/<id>，实际契约值 %q", want)
+	}
+}
+
+// TestContainerCgroupDirEmptyIDIsEmpty 断言空 ID 返回空串。
+//
+// 空串是"跳过归置"的信号，必须与"路径拼出来但目录不存在"区分开——
+// 后者会报错（这是刻意的），前者静默保持旧行为。
+func TestContainerCgroupDirEmptyIDIsEmpty(t *testing.T) {
+	if got := containerCgroupDir(""); got != "" {
+		t.Errorf("空容器 ID 应返回空串，实际 %q", got)
 	}
 }

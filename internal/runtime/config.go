@@ -72,6 +72,17 @@ type ExecOptions struct {
 	Stdin, Stdout, Stderr *os.File
 	// TTY 表示申请伪终端（-t）。
 	TTY bool
+	// CgroupID 是容器 ID，用于把 exec 进程放入容器的 cgroup。
+	//
+	// v0.9.2 新增字段，**不改动既有签名**（按 AGENTS.md，新增接口需在
+	// 《冻结接口》登记）。为空时跳过 cgroup 归置。
+	//
+	// 为什么必须有它：exec 走宿主侧 nsenter，新起的进程默认落在**调用者
+	// （CLI）自己的 cgroup**——实测为 user.slice/user-0.slice/session-7.scope，
+	// 而不是容器的 /licore/<id>。这使 `licore exec` 完全绕过 --memory /
+	// --pids-limit 等所有资源限额：实测容器限额 256 MiB，exec 进去的进程
+	// 吃到 400 MiB 也不被拦，宿主 OOM 风险直接回归。
+	CgroupID string
 }
 
 // Validate 检查配置完备性。
