@@ -6,7 +6,11 @@ package image
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -228,6 +232,83 @@ func validateDigest(s string) error {
 
 func hasAllowedAnnotationPrefix(k string) bool {
 	return strings.HasPrefix(k, "org.licore.") || strings.HasPrefix(k, "dev.licore.")
+}
+
+// SafeExtractPath 校验「把归档条目 rel 解压到 rootDir 之下」是否安全，
+// 并返回解析后的绝对目标路径。
+//
+// 这是**解压类代码唯一的父链校验入口**：先做 SafeArchivePath 的条目名
+// 校验，再把 rel 的每一级**已存在**父组件 lstat 一遍，要求它们是真实目录。
+//
+// 为什么单靠 SafeArchivePath 不够（CVE 级别的经典漏洞形态）：
+// SafeArchivePath 只看**条目名本身**是否含 "/../"，看不见**文件系统上已经
+// 存在**的符号链接。于是下面这个归档能穿透出去：
+//
+//	条目 1: linkdir/        目录
+//	条目 2: linkdir/up      符号链接 → ../../victim
+//	条目 3: linkdir/up/x    普通文件
+//
+// 条目 3 的名字完全"干净"，但 /linkdir/up 是个指向外部的符号链接，
+// 写入会经它落到 rootDir 之外。**必须逐级 lstat 父组件**才能拦住。
+//
+// 语义细节：
+//   - finalMustDir=false（默认写文件场景）：**末级**允许是已存在的符号链接
+//     或普通文件——先删后写、不跟随，本身就是安全的原子替换；
+//   - finalMustDir=true（建目录 / whiteout 场景）：末级也必须是真实目录或
+//     不存在，否则拒绝；
+//   - 不存在的父组件视为合法（调用方后续 MkdirAll 创建）。
+//
+// 返回的 target 已确认落在 rootDir 之内（filepath.Rel 双重校验）。
+func SafeExtractPath(rootDir, rel string, finalMustDir bool) (string, error) {
+	if err := SafeArchivePath(rel); err != nil {
+		return "", err
+	}
+	target := filepath.Join(rootDir, filepath.FromSlash(rel))
+	// 双保险：Join 之后必须仍在 rootDir 之内。
+	back, err := filepath.Rel(rootDir, target)
+	if err != nil || back == ".." || strings.HasPrefix(back, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("目标 %q 越出 %q: %w", rel, rootDir, ErrUnsafePath)
+	}
+	if err := checkParentChain(rootDir, target, finalMustDir); err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
+// checkParentChain 逐级校验 target 相对 rootDir 的路径组件。
+//
+// 父组件：必须不存在（待创建）或是真实目录；符号链接与普通文件一律拒绝。
+// 末级：finalMustDir 为真时同父组件标准，为假时允许任意已存在类型
+// （覆盖替换是安全的，见 SafeExtractPath 说明）。
+func checkParentChain(rootDir, target string, finalMustDir bool) error {
+	back, err := filepath.Rel(rootDir, target)
+	if err != nil || back == "." || strings.HasPrefix(back, ".."+string(filepath.Separator)) {
+		return nil // 目标就是 rootDir 自身：无父链可查
+	}
+	comps := strings.Split(back, string(filepath.Separator))
+	cur := rootDir
+	for i, comp := range comps {
+		cur = filepath.Join(cur, comp)
+		final := i == len(comps)-1
+		fi, err := os.Lstat(cur)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return nil // 后续层级尚不存在
+		case err != nil:
+			return fmt.Errorf("检查路径组件 %q: %w", cur, err)
+		case fi.Mode()&fs.ModeSymlink != 0:
+			if final && !finalMustDir {
+				return nil // 覆盖符号链接本身：先删后写，不跟随
+			}
+			return fmt.Errorf("拒绝经由符号链接解压写出 %q: %w", cur, ErrUnsafePath)
+		case !fi.IsDir():
+			if final && !finalMustDir {
+				return nil
+			}
+			return fmt.Errorf("路径组件 %q 不是目录: %w", cur, ErrUnsafeLayer)
+		}
+	}
+	return nil
 }
 
 // SafeArchivePath 校验归档条目名：必须是干净的相对路径，

@@ -256,27 +256,28 @@ func writeRegFile(target string, mode fs.FileMode, name string, r io.Reader, siz
 
 // ensureParents 保证 target 的所有祖先组件要么是真实目录、要么被本函数
 // 创建为目录；任何组件若是符号链接或普通文件即拒绝（防符号链接穿透写）。
+//
+// 父链判定委托给 image.SafeExtractPath —— 与 internal/convert 共用同一份
+// 实现。历史上这里是私有实现，而 convert 那份是空白的，于是 convert 漏了
+// 符号链接穿透（见 docs/security-audit-v2.md H-1）。**不要再复制这段逻辑**，
+// 解压类代码一律走 image 包的公共校验。
 func ensureParents(base, target string) error {
 	rel, err := filepath.Rel(base, target)
 	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
 		return fmt.Errorf("目标 %q 逃逸出 %q: %w", target, base, image.ErrUnsafePath)
 	}
-	cur := base
+	if _, err := image.SafeExtractPath(base, filepath.ToSlash(rel), false); err != nil {
+		return err
+	}
+	// SafeExtractPath 只校验、不创建；这里补齐创建语义。
 	comps := strings.Split(rel, string(filepath.Separator))
+	cur := base
 	for _, comp := range comps[:len(comps)-1] {
 		cur = filepath.Join(cur, comp)
-		fi, err := os.Lstat(cur)
-		switch {
-		case errors.Is(err, fs.ErrNotExist):
+		if _, err := os.Lstat(cur); errors.Is(err, fs.ErrNotExist) {
 			if err := os.Mkdir(cur, 0o755); err != nil && !os.IsExist(err) {
 				return fmt.Errorf("创建中间目录 %q: %w", cur, err)
 			}
-		case err != nil:
-			return fmt.Errorf("检查中间目录 %q: %w", cur, err)
-		case fi.Mode()&fs.ModeSymlink != 0:
-			return fmt.Errorf("拒绝经由符号链接写出 %q: %w", cur, image.ErrUnsafePath)
-		case !fi.IsDir():
-			return fmt.Errorf("中间组件 %q 不是目录: %w", cur, ErrCorruptLayer)
 		}
 	}
 	return nil

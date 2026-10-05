@@ -6,8 +6,10 @@ package convert
 import (
 	"archive/tar"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -18,6 +20,7 @@ import (
 	"syscall"
 
 	"github.com/LiStudioorg/licore/internal/build"
+	"github.com/LiStudioorg/licore/internal/image"
 )
 
 // Options 描述一次 Docker → LiCore 转换。
@@ -433,31 +436,48 @@ func extractTar(tarPath, dst string) error {
 }
 
 // extractEntry 解出一个归档条目，并做路径逃逸防护。
+//
+// **两层防护，缺一不可**：
+//  1. 条目名本身：绝对路径、".." 段、非规范化路径 —— image.SafeExtractPath
+//     内部先跑 SafeArchivePath；
+//  2. **父链**：目标路径上每一级已存在的父组件必须是真实目录。只做第 1 层
+//     是不够的——归档可以"先放一个符号链接条目、再经由它写文件"，此时
+//     条目名完全干净，但写入会穿透到目标目录之外（真实逃逸漏洞，
+//     见 docs/security-audit-v2.md 的 H-1）。
+//
+// 因此逐条复用 image.SafeExtractPath，而不是各自手写一套路径判断。
 func extractEntry(tr *tar.Reader, hdr *tar.Header, dst string) error {
 	name := filepath.Clean(hdr.Name)
 	if name == "." || name == "" {
 		return nil
 	}
-	// 逃逸防护：绝对路径与上跳路径一律拒绝。docker export 正常不会产生这些，
-	// 出现即意味着归档被构造过。
-	if filepath.IsAbs(name) || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("convert: 归档条目 %q 路径逃逸，拒绝解压", hdr.Name)
-	}
-	target := filepath.Join(dst, name)
-	// 双保险：Join 之后必须仍在 dst 之内。
-	rel, err := filepath.Rel(dst, target)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("convert: 归档条目 %q 越出目标目录", hdr.Name)
+	// 建目录与硬链接的末级也须是真实目录/不存在；写文件与建符号链接时
+	// 末级允许被覆盖（先删后写，不跟随）。
+	finalMustDir := hdr.Typeflag == tar.TypeDir
+	target, err := image.SafeExtractPath(dst, filepath.ToSlash(name), finalMustDir)
+	if err != nil {
+		return fmt.Errorf("convert: 归档条目 %q: %w", hdr.Name, err)
 	}
 
 	switch hdr.Typeflag {
 	case tar.TypeDir:
-		return os.MkdirAll(target, fs(hdr.Mode))
+		if err := os.MkdirAll(target, fs(hdr.Mode)); err != nil {
+			return fmt.Errorf("convert: 创建目录 %s 失败: %w", target, err)
+		}
+		return nil
 	case tar.TypeReg:
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return fmt.Errorf("convert: 创建父目录失败: %w", err)
 		}
-		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, fs(hdr.Mode))
+		// **必须先删掉已存在的目标**，不能用 O_CREATE|O_TRUNC 直接写：
+		// O_TRUNC 会**跟随**已存在的符号链接（内核解析到链接目标再截断），
+		// 于是"rootfs 内预置一个指向宿主文件的符号链接"就构成第二条穿透路径
+		// ——它绕过了父链校验（末级符号链接是允许覆盖的），却依然写到了外面。
+		// 删除后重建是"替换链接本身"，不跟随。实测确认过 O_TRUNC 的行为。
+		if err := removeExisting(target); err != nil {
+			return fmt.Errorf("convert: 移除已存在目标 %s 失败: %w", target, err)
+		}
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_EXCL, fs(hdr.Mode))
 		if err != nil {
 			return fmt.Errorf("convert: 创建文件 %s 失败: %w", target, err)
 		}
@@ -476,7 +496,14 @@ func extractEntry(tr *tar.Reader, hdr *tar.Header, dst string) error {
 		}
 		return nil
 	case tar.TypeLink:
-		src := filepath.Join(dst, filepath.Clean(hdr.Linkname))
+		// 硬链接的**落点**父链已由 SafeExtractPath 校验；其**源**路径同样
+		// 必须校验，否则 `linkname` 可以指向 rootfs 之外（如 ../../etc/passwd），
+		// 把宿主敏感文件硬链接进 rootfs 并随镜像打包外泄。
+		linkRel := filepath.ToSlash(filepath.Clean(hdr.Linkname))
+		src, err := image.SafeExtractPath(dst, linkRel, false)
+		if err != nil {
+			return fmt.Errorf("convert: 归档条目 %q 硬链接源 %q: %w", hdr.Name, hdr.Linkname, err)
+		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return fmt.Errorf("convert: 创建父目录失败: %w", err)
 		}
@@ -491,6 +518,24 @@ func extractEntry(tr *tar.Reader, hdr *tar.Header, dst string) error {
 		slog.Debug("convert: 跳过归档中的特殊条目", "name", hdr.Name, "type", string(hdr.Typeflag))
 		return nil
 	}
+}
+
+// removeExisting 删除已存在的目标路径（文件 / 符号链接 / 空目录），
+// 不存在时是 no-op。
+//
+// 用 Lstat 判定而不跟随符号链接：调用方的语义是"替换这个路径本身"，
+// 而不是"写到它指向的地方"。这正是防 O_TRUNC 跟随链接的关键一步。
+// 目录只在为空时才能被 Remove 删掉——非空目录说明归档本身自相矛盾
+// （先建目录又当文件写），报错比静默递归删除安全。
+func removeExisting(p string) error {
+	_, err := os.Lstat(p)
+	if errors.Is(err, iofs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return os.Remove(p)
 }
 
 // fs 把 tar 的 mode 转成 os.FileMode，并剥掉 setuid/setgid/sticky 位——
