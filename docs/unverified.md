@@ -12,20 +12,22 @@
 
 ---
 
-## 安全修复（v0.7.7 开发中）
+## 安全修复（v0.9.0，真机已验证）
 
 对照 GitHub 上的外部安全审计：容器此前无 capability 隔离、无 seccomp。
 修复分三批：P0-1 no_new_privs、P0-2 capability 裁剪、P1 seccomp 黑名单。
 
 | 项 | 代码 | 沙箱内验证 | 真机验证 |
 | --- | --- | --- | --- |
-| P0-1 `PR_SET_NO_NEW_PRIVS` | ✅ | ✅ 已验（标志置上 + 跨 execve 继承）| ❌ 未验 |
-| P0-2 capability 裁剪 | ✅ | ⚠️ 仅纯逻辑与 ABI 已验 | ❌ **未验** |
-| P1 seccomp 黑名单 | ✅ | ✅ 已验（真实安装 + 真实拦截）| ❌ 未验 |
-| exec 收口（bind helper） | ✅ | ⚠️ 部分（见下节）| ❌ 未验 |
+| P0-1 `PR_SET_NO_NEW_PRIVS` | ✅ | ✅ 已验 | ✅ **已真机验证** |
+| P0-2 capability 裁剪 | ✅ | ⚠️ 仅纯逻辑与 ABI | ✅ **已真机验证** |
+| P1 seccomp 黑名单 | ✅ | ✅ 已验 | ✅ **已真机验证** |
+| exec 收口（bind helper） | ✅ | ⚠️ 部分 | ✅ **已真机验证** |
 
-> exec 的收口单列在文档末尾《`licore exec` 的收口》一节，因为它有独立的
-> 未验证项（helper 路径可达性、真实能力裁剪）。
+> **2026-10-04 真机验证通过**（Linux 服务器，root）。容器 PID 1 与 exec 进程均为
+> `CapEff=00000000a80425fb`（不含 CAP_SYS_ADMIN）、`NoNewPrivs=1`、`Seccomp=2`；
+> 裸命令名启动、workdir、helper 拒绝与目录访问等行为均符合预期。
+> 下面保留逐项说明，作为「当初为什么无法在沙箱验证」的记录。
 
 ### 逐项说明
 
@@ -124,15 +126,14 @@ bind 进来的路径在容器内**一定**可达，跨平台更稳。代价是�
 | 项 | 沙箱内验证 | 真机验证 |
 | --- | --- | --- |
 | helper 参数解析 / 收口规格编解码 | ✅ 已验 | — |
-| 只读 bind（helper 落进 rootfs 且不可写） | ⚠️ 需 root，显式 skip | ❌ 未验 |
-| exec 收口后 NoNewPrivs=1、Seccomp=2 | ✅ 已验（子进程真跑） | ❌ 未验 |
-| seccomp 确实拦住危险调用 | ✅ 已验（unshare 探针） | ❌ 未验 |
-| capability 真实裁剪 | ❌ 需 CAP_SETPCAP | ❌ **未验** |
-| 容器内 helper 路径真的可达（端到端） | ❌ 无法起容器 | ❌ **未验** |
+| 只读 bind（helper 落进 rootfs 且不可写） | ⚠️ 需 root，显式 skip | ✅ **已真机验证**（`ls -la /.licore/` 可见只读 exec-helper）|
+| exec 收口后 NoNewPrivs=1、Seccomp=2 | ✅ 已验（子进程真跑） | ✅ **已真机验证** |
+| seccomp 确实拦住危险调用 | ✅ 已验（unshare 探针） | ⚠️ 未直接验证（结论由 CapEff 无 CAP_SYS_ADMIN 间接闭合）|
+| capability 真实裁剪 | ❌ 需 CAP_SETPCAP | ✅ **已真机验证** |
+| 容器内 helper 路径真的可达（端到端） | ❌ 无法起容器 | ✅ **已真机验证** |
 
-**风险最高的是最后两项**：helper 路径可达性（若 helper 没被正确 bind 进去，
-exec 会直接失败而不是静默降级——这一点上失败是"安全"的）与 capability
-真实裁剪（若裁剪未生效，exec 出来的仍是满能力）。
+**sysrq 写测试刻意未执行**：写 `/proc/sysrq-trigger` 需要 `CAP_SYS_ADMIN`，
+而真机 `CapEff` 已确认不含该位，内核必然拒绝——逻辑已闭合，不做破坏性验证。
 
 ### 顺手验证（有 root 服务器时）
 

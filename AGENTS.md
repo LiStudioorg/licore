@@ -226,6 +226,33 @@ licore shutdown       由系统服务停止时调用，优雅停止自启容器
 - **依赖**：阶段 0 `go.mod` 保持零第三方依赖；新增第三方库必须在 PR 里单独说明理由，容器/镜像/oci 相关的库一律不批。
 - **命名与注释**：导出标识符必须有文档注释；文件头保留 AGPL 版权声明两行。
 
+## 操作规范（真机/特权环境）
+
+**破坏性命令必须与只读命令分开执行，且执行前停下等用户确认。**
+
+规则：
+
+1. **不许把破坏性命令和只读命令写在同一次 shell 调用里。** 破坏性命令永远单独一条。
+2. 破坏性命令要在注释/说明里以 `DESTRUCTIVE:` 开头标注，写清"最坏情况下会发生什么"。
+3. 跑之前停下来让用户确认，不要自行执行。
+
+什么算破坏性命令（示例，非穷举）：
+
+- 写 `/proc/sysrq-trigger`（会重启/挂起宿主）
+- `kill -9` 容器 1 号进程或 shim
+- 故意制造挂载失败、磁盘满、OOM 的测试
+- 触碰或重启**非本次测试**的容器 / 服务
+- 任何修改宿主全局状态的命令
+
+**为什么单独成条**：本仓库真机上出过一次事故——一条 bash 调用里同时包含了
+只读的 `ls /.licore/` 与破坏性的 `echo b > /proc/sysrq-trigger`，执行后宿主
+重启，而日志在该时刻戛然而止。事后**无法从记录上区分**是"破坏性命令没跑到"
+还是"跑到了但没留下日志"，因此也无法确定责任。混合执行会**销毁判断依据**，
+这比事故本身更难处理。
+
+补充：即便只读验证，也要注意**不要碰非本次测试的资源**。本仓库的开发机同时
+跑着生产服务，验证时只操作自己创建的容器。
+
 ## 禁止事项
 
 1. **禁止**引入任何第三方容器组件 / 容器库（Docker、containerd、runc、buildkit、OCI 相关库、cgroups 库等）——容器生态完全自研。
@@ -266,8 +293,10 @@ v0.7.x 及以前用自研 cgo 组件 fork 单线程子进程来完成 setns。v0
   返回 `ErrNoNsenter` 并附带安装指引。
 - **必须用短选项** `-t/-m/-u/-i/-n/-p`：busybox 的 nsenter **不支持任何长选项**
   （`--target` 会直接报错），长选项虽在 util-linux 上更可读却不可移植。
-- **工作目录必须写成紧贴形式 `-w<dir>`**：`-w` 的参数在 util-linux 与 busybox 上
-  都是「可选」的，写成 `-w` `/app` 会把 `/app` 当成要执行的命令。
+- **不要用 nsenter 的 `-w`**：它是"先 chdir 再 setns"，chdir 发生在宿主 mount
+  namespace，切到容器 mount ns 后 cwd 指向的 inode 可能不存在，`getcwd` 会失败
+  （真机实测）。工作目录改由容器内的 exec helper 自己 chdir，见《容器权限隔离》
+  的《exec 的收口》。同理不要加 `-r/`——setns 后根目录已经是容器 root。
 - `-S/-G`（uid/gid）两个实现写法一致，可直接使用；其余用户态处理（伪终端分配、
   stdio 透传）仍由 Go 侧 `internal/runtime.Exec` 负责。
 - 目标命令前必须加 `--`，否则以 `-` 开头的命令会被 nsenter 当成自己的选项。
@@ -291,13 +320,13 @@ CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -o licore-android-arm64 .
 CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o licore-darwin-arm64 .
 ```
 
-## 容器权限隔离（v0.8.0 起）
+## 容器权限隔离（v0.9.0 起）
 
 **这是安全属性，不是可选优化。改动这一节前必须读懂每条"为什么"。**
 
 背景：root 下运行时 `nsplan_linux.go` 的判定**不**附加 `CLONE_NEWUSER`
 （理由是加了会把容器内 root 映射成普通用户、失去挂载能力）。因此容器 init
-是**真正的宿主 root**。v0.8.0 之前没有任何裁剪，容器内可以直接
+是**真正的宿主 root**。v0.9.0 之前没有任何裁剪，容器内可以直接
 `echo b > /proc/sysrq-trigger` 重启宿主。
 
 三层防护，全部在 `internal/runtime/init_linux.go` 的 `executeContainerCmd`
@@ -350,7 +379,7 @@ CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o licore-darwin-arm64 .
 同一时机），exec 时由 nsenter 在容器内执行它：
 
 ```
-nsenter ... -r/ -w/ -- /.licore/exec-helper exec-setup -- <用户命令>
+nsenter ... -m -u -i -n -p -- /.licore/exec-helper exec-setup [--workdir <dir>] -- <用户命令>
 ```
 
 helper（`runtime.RunExecSetup`）按**与容器 init 相同**的顺序收口后再 execve：
@@ -406,17 +435,26 @@ no_new_privs → capability 裁剪 → seccomp。
 
 除此之外的第三方依赖一律不批；容器 / 镜像 / OCI / cgroups 相关库永久禁止（见"禁止事项"）。日志、配置、压缩、归档一律用标准库（`log/slog`、`archive/tar`、`compress/gzip`、`encoding/json`、`crypto/sha256`）。
 
-## 当前阶段：v0.8.0（容器权限隔离 + Docker 镜像转换）
+## 当前阶段：v0.9.0（安全隔离真机验证通过）
 
-**v0.8.0 已完成**：外部安全审计后的权限隔离修复 + Docker 镜像转换。
+**v0.9.0 已完成并通过真机验证**：容器权限隔离 + exec 收口 + Docker 镜像转换。
 
-- **容器权限隔离（三层 + exec 收口，详见《容器权限隔离》一节）**：v0.8.0 之前容器在
+**真机验证结果**（Linux 服务器，root）：
+
+| 检查项 | 结果 |
+| --- | --- |
+| 容器 PID 1 与 exec 进程 | `CapEff=00000000a80425fb`（不含 CAP_SYS_ADMIN）、`NoNewPrivs=1`、`Seccomp=2` |
+| 裸命令名启动 `run -d ... sleep 3600` | ✅ 成功（PATH 查找生效）|
+| `exec -w /tmp` / 不带 `-w` / `-w /nonexistent` | ✅ `/tmp` / `/` / 明确报错 |
+| 直接调 `/.licore/exec-helper` | ✅ 被拒绝并给出正确用法 |
+| 列 `/.licore/` 目录 | ✅ 允许（只精确拒绝 helper 本身）|
+
+- **容器权限隔离（三层 + exec 收口，详见《容器权限隔离》一节）**：v0.9.0 之前容器在
   root 下运行时就是**真正的宿主 root 且持有全部 capability**，容器内可直接
   `echo b > /proc/sysrq-trigger` 重启宿主、可加载 eBPF、可改写宿主 `/proc/sys`。
   现补齐 no_new_privs + capability 裁剪（默认集与 Docker 一致）+ seccomp 黑名单，
   并新增 `--cap-add` / `--cap-drop`。`licore exec` 同样收口（容器内只读 helper），
   且 exec **只允许收紧、拒绝 --cap-add**。
-  **注意：真机尚未验证，见 [docs/unverified.md](docs/unverified.md)。**
 - **`licore convert`**：把 Docker 镜像转成 `.licore`（`docker export` 导出 rootfs +
   `docker inspect` 重建运行配置），支持单个与批量（`--from-file` / `--jobs`）。
   限制见 [docs/convert.md](docs/convert.md)——尤其是 `HEALTHCHECK` 会被**静默丢弃**。
