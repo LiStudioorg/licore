@@ -92,7 +92,22 @@ cleanup_verify() {
     "$LICORE_BIN" stop "$n" >/dev/null 2>&1 || true
     "$LICORE_BIN" rm -f "$n" >/dev/null 2>&1 || true
   done
-  rm -rf "$VERIFY_HOME"
+  # **绝不 rm -rf 数据目录本身**。
+  #
+  # 初版会 `rm -rf "$VERIFY_HOME"`，而 LICORE_VERIFY_HOME 是用户可传的。
+  # 实测事故：本脚本以 LICORE_VERIFY_HOME=/root/.licore 运行过一次，
+  # 直接**删掉了生产数据目录**（含已导入镜像与一个既有容器）。
+  # 审计脚本不该有这种能力——删镜像/容器是用户的决定，不是脚本的副作用。
+  #
+  # 现在只删**本脚本自己**在上面创建的临时资源：
+  #   - RUNNING 里的 licore-secverify-* 容器（已删）
+  #   - /tmp 下本脚本自建的只读卷源目录
+  # 数据目录原样保留。
+  if [ "$VERIFY_HOME_CREATED" = yes ]; then
+    info "数据目录 $VERIFY_HOME 是本脚本新建的，保留（如需清理请手动 rm -rf）"
+  else
+    info "数据目录 $VERIFY_HOME 是既有目录，未做任何删除（只删了本脚本创建的容器）"
+  fi
 }
 
 on_exit() {
@@ -140,11 +155,25 @@ if ! command -v "$LICORE_BIN" >/dev/null 2>&1 && [ ! -x "$LICORE_BIN" ]; then
   exit 2
 fi
 
-info "licore      : $("$LICORE_BIN" version 2>/dev/null || echo "(version 子命令不可用)")"
+info "licore      : $("$LICORE_BIN" --version 2>/dev/null | head -n1 || echo "(取不到版本)")"
 info "内核        : $(uname -r)"
 info "数据目录    : $VERIFY_HOME"
 info "镜像        : $IMAGE"
 info "sysrq 测试  : $([ "$UNSAFE" = yes ] && echo '将执行（--unsafe）' || echo '跳过（默认）')"
+
+# 数据目录安全提示：默认值在 /tmp 下，指向别处（尤其是生产目录）时明确
+# 告知用户——脚本会往该目录**写入容器与镜像**，虽然不会删除目录本身，
+# 但在生产数据目录里创建测试容器仍是不该默默发生的事。
+case "$VERIFY_HOME" in
+  /tmp/*) : ;;
+  *)
+    echo
+    echo "注意：LICORE_VERIFY_HOME=$VERIFY_HOME 不在 /tmp 下。"
+    echo "      脚本会在该数据目录内**创建测试容器**（licore-secverify-*）。"
+    echo "      不会删除该目录，但建议用独立目录以免与生产容器混淆。"
+    echo
+    ;;
+esac
 
 if [ "$UNSAFE" = yes ]; then
   echo
@@ -190,28 +219,43 @@ cexec() {
   "$LICORE_BIN" exec "$name" "$@" 2>&1
 }
 
-# probe_open_wronly NAME PATH → "DENIED" / "WRITABLE" / "MISSING"
-# 只做 open(O_WRONLY)，不写入任何内容。
-probe_open_wronly() {
-  local name="$1" path="$2"
-  local out
-  out="$(cexec "$name" /bin/sh -c "
-    if [ ! -e '$path' ]; then echo MISSING; exit 0; fi
-    if (: > '$path') 2>/dev/null; then echo WRITABLE; else echo DENIED; fi
-  ")"
-  # 上面用 ': > path' 会截断文件——对本脚本测的文件（size 0 或只读挂载）
-  # 无实质影响，但为绝对安全改用 python/awk 不可靠，这里用 dd 探测。
-  echo "$out" | tail -n1
-}
-
 # safe_probe NAME PATH → DENIED / WRITABLE / MISSING
-# 用 dd 打开 O_WRONLY 但不写一个字节（count=0），比 ': > path' 更保守。
+#
+# **判据必须是 write，不能是 open。**
+#
+# 初版用 `dd count=0`（只 open、不 write）判断，真机上把 /proc/kpageflags
+# 误报成 WRITABLE。原因是容器 init 是宿主 uid 0、持有 CAP_DAC_OVERRIDE，
+# **open(O_WRONLY) 会成功**（DAC 被绕过），内核在 write() 时才拒绝。
+# 真机实测（宿主 root 直接操作同一批文件，用 python 的 os.write）：
+#
+#     /proc/kpageflags: open OK, write 拒绝 (EIO)
+#     /proc/kcore:      open OK, write 拒绝 (EIO)
+#     /proc/kmsg:       open OK, write 拒绝 (EIO)
+#     /proc/mtrr:       open OK, write 拒绝 (EINVAL)
+#
+# 也不能用 `conv=notrunc`：对 1 字节输入它会**跳过 write**（dd 认为无可写
+# 内容），于是又退化成"只 open"，同样误报。
+#
+# 采用的办法：`printf 'x' | dd of=PATH bs=1 count=1`（**不带 conv**）。
+#   - 真的发出一次 write(2)，内核 handler 据此给出真实判据；
+#   - 对只读挂载的 procfs 文件，open 阶段就报 "Read-only file system"；
+#   - 对内核做了 capable() 检查的文件，write 报 EIO/EINVAL/EPERM；
+#   - 对 /proc/sys 下真的**可写**的文件（隔离失效时）会写入 'x' 这一个
+#     字节 —— 这正是我们想探测的状态，而且它意味着"已经出事了"，
+#     此时脚本会把它标红；还原与否已不影响结论。
+#   - 真机实测全部危险文件均为 DENIED，宿主 /proc/sys 未被改动
+#     （core_pattern 仍为 "core"、kptr_restrict 仍为 1、sysrq 仍为 176，
+#     uptime 连续，宿主未重启）。
 safe_probe() {
   local name="$1" path="$2"
   local out
   out="$(cexec "$name" /bin/sh -c "
     if [ ! -e '$path' ]; then echo MISSING; exit 0; fi
-    if dd if=/dev/null of='$path' bs=1 count=0 2>/dev/null; then echo WRITABLE; else echo DENIED; fi
+    if printf 'x' | dd of='$path' bs=1 count=1 2>/dev/null; then
+      echo WRITABLE
+    else
+      echo DENIED
+    fi
   ")"
   echo "$out" | tail -n1
 }
@@ -220,6 +264,11 @@ safe_probe() {
 # 起容器
 # ---------------------------------------------------------------------------
 step "1. 创建测试容器"
+
+# 记录数据目录是"本脚本新建"还是"既有"——仅用于清理时给出正确提示，
+# 无论如何都**不会删除**它（见 cleanup_verify 的事故说明）。
+VERIFY_HOME_CREATED=no
+[ -d "$VERIFY_HOME" ] || VERIFY_HOME_CREATED=yes
 
 if ! "$LICORE_BIN" run -d --name "$NAME_MAIN" "$IMAGE" sleep 600 >/tmp/secverify-run.log 2>&1; then
   echo "容器启动失败，输出如下：" >&2
@@ -413,7 +462,16 @@ else
     timeout 8 sh -c "echo > /dev/tcp/1.1.1.1/443" >/dev/null 2>&1 && echo OK || echo FAIL
   ')"
   r="$(echo "$r" | tail -n1)"
-  [ "$r" = "OK" ] && pass "T-3b 容器可访问外网（1.1.1.1:443）" || skip "T-3b 容器出网失败：$r（可能宿主无外网）"
+  if [ "$r" = "OK" ]; then
+    pass "T-3b 容器可访问外网（1.1.1.1:443）"
+  else
+    skip "T-3b 容器出网失败：$r"
+    info "  排查：若本机已存在 licore0 网桥而本脚本用了隔离数据目录，"
+    info "        两者网段可能不一致（真机实测过：网桥 172.22.0.1，"
+    info "        新 store 分配 172.21.0.0/16 → 网关不存在、出网必失败）。"
+    info "        这是引擎的已知缺陷（见 docs/security-audit-v2.md L-6），"
+    info "        与隔离无关。用 LICORE_HOME=<既有数据目录> 复跑可验证。"
+  fi
 
   # 宿主能访问容器端口映射：起一个监听并映射
   "$LICORE_BIN" run -d --name "$NAME_RO" -p 18099:8099 "$IMAGE" \
@@ -425,7 +483,7 @@ else
       pass "T-3c 经宿主 IP 访问端口映射返回 200"
     else
       info "  T-3c 返回码：${code:-<无响应>}"
-      skip "T-3c 端口映射未返回 200（可能是容器内 nc 行为差异，非隔离问题）"
+      skip "T-3c 端口映射未返回 200（容器内 nc 行为差异，或上述网段不一致）"
     fi
   else
     skip "T-3c $NAME_RO 未启动，跳过端口映射测试"
@@ -459,8 +517,12 @@ INITCG="$(cat "/proc/$INIT_PID/cgroup" 2>/dev/null | tail -n1)"
 info "  容器 init cgroup：$INITCG"
 info "  exec 进程 cgroup：$EXECCG"
 
-if [ -n "$EXECCG" ] && echo "$EXECCG" | grep -q "/licore/"; then
-  pass "T-4a exec 进程被归入 /licore/<id> cgroup"
+if [ -n "$EXECCG" ] && [ "$EXECCG" = "$INITCG" ]; then
+  # 与容器 init **同一个** cgroup 才算真正归置：只判 "含 /licore/" 会漏掉
+  # "落进别人的容器 cgroup" 这种错位。
+  pass "T-4a exec 进程与容器 init 同 cgroup（$EXECCG）"
+elif [ -n "$EXECCG" ] && echo "$EXECCG" | grep -q "/licore/"; then
+  fail "T-4a exec 进程在 $EXECCG，但容器 init 在 $INITCG —— 归置到了别的组"
 elif [ -n "$EXECCG" ]; then
   fail "T-4a exec 进程落在 $EXECCG，未归入容器 cgroup（会绕过 --memory 限额）"
 else
@@ -528,7 +590,7 @@ fi
 # 修复项回归（H-1 / M-1 / M-2 不需要真机，但顺带确认二进制是新版）
 # ---------------------------------------------------------------------------
 step "T-7 版本确认（H-1 / M-1 / M-2 修复应在 v0.9.6+）"
-VER="$("$LICORE_BIN" version 2>/dev/null | tr -d '\n')"
+VER="$("$LICORE_BIN" --version 2>/dev/null | head -n1 | tr -d '\n')"
 info "  licore version：$VER"
 if echo "$VER" | grep -qE "v0\.9\.[6-9]|v0\.([1-9][0-9])|v[1-9]"; then
   pass "T-7 二进制为 v0.9.6 或更新（含 H-1 / M-1 / M-2 修复）"
