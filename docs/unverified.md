@@ -12,6 +12,44 @@
 
 ---
 
+## 安全审计 v2 修复（v0.9.6）
+
+对照 [docs/security-audit-v2.md](security-audit-v2.md) 的三条修复。
+
+| 项 | 代码 | 沙箱内验证 | 真机验证 |
+| --- | --- | --- | --- |
+| H-1 `convert` tar 符号链接穿透 | ✅ | ✅ **已验 + 反向验证** | — （不需要真机）|
+| M-1 Hub JWT 密钥可预测 | ✅ | ✅ **已验 + 反向验证** | ⏳ 待真机（伪造令牌端到端）|
+| M-2 Hub JWT 无 exp 永久有效 | ✅ | ✅ **已验 + 反向验证** | — （不需要真机）|
+| G112 Hub Slowloris 超时 | ✅ | ✅ 编译期 | — （不需要真机）|
+
+**H-1 为什么不需要真机**：漏洞与修复都在纯文件系统层
+（`archive/tar` + `Lstat`），不涉及 namespace/能力/挂载，沙箱内可完整复现。
+反向验证已确认漏洞版本上 8/12 用例失败、修复版本 12/12 通过。
+
+**M-1 的真机部分**：密钥强度与签名逻辑已在单元测试中完整覆盖（含伪造
+令牌被拒），真机验证只剩"部署后实际调用 Hub API 伪造失败"这一端到端确认，
+不是修复本身未验证。仍登记在此，以免被当成已端到端验证。
+
+### 待真机验证的安全项（**本清单的核心**）
+
+审计 v2 的 A 类（容器逃逸）与 B 类（网络隔离）**本次一条都未验证**——
+沙箱 `CapEff=0`，无法创建容器。验证脚本已就绪：
+[scripts/verify-security.sh](../scripts/verify-security.sh)
+
+| 脚本节 | 覆盖 | 状态 |
+| --- | --- | --- |
+| T-1 | CapEff/NoNewPrivs/Seccomp、`/proc/sys` 只读、sysrq mask、**`/proc/mtrr`**、设备节点、seccomp 实拦、PID ns | ⏳ 未跑 |
+| T-2 | `exec` 收口（位图须与容器 PID 1 一致）、`--cap-add` 被拒 | ⏳ 未跑 |
+| T-3 | 容器→宿主阻断、出网、端口映射回包、LICORE-INPUT/nft | ⏳ 未跑 |
+| T-4 | `exec` 的 cgroup 归置（v0.9.2 修复的回归）| ⏳ 未跑 |
+| T-5 | 卷 `:ro` 真正只读 | ⏳ 未跑 |
+| T-6 | **DESTRUCTIVE** sysrq 真实写入（默认跳过，须 `--unsafe`）| ⏳ 未跑 |
+
+> 用法：`sudo bash scripts/verify-security.sh`，跑完把完整输出贴回审计会话。
+
+---
+
 ## 安全修复（v0.9.0，真机已验证）
 
 对照 GitHub 上的外部安全审计：容器此前无 capability 隔离、无 seccomp。
