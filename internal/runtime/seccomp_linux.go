@@ -181,6 +181,16 @@ func blockedSyscallRules() []seccompRule {
 	rules = append(rules, seccompRule{
 		Name: "clone(CLONE_NEWUSER)", NR: uint32(syscall.SYS_CLONE), ArgMask: cloneNewuser,
 	})
+	// 跨进程内存访问：process_vm_readv/writev 能直接读写**其它进程的内存**，
+	// kcmp 能比较两个进程的 fd/内存状态（经典侧信道）。三者都需
+	// CAP_SYS_PTRACE，该能力已被默认集丢弃，因此这里是**第二层**——
+	// 但它挡的正是"用户 --cap-add SYS_PTRACE 之后"的场景：ptrace 本身有
+	// 无条件拦截兜底，这三条原先没有，会出现"加了 SYS_PTRACE 就能绕过"的洞。
+	//
+	// 编号按架构分文件（seccomp_vmproc_*_linux.go）：x86 上标准库不导出这些
+	// 常量，只能手写；arm64/riscv64 直接复用 syscall.SYS_*。
+	rules = append(rules, archSpecificVMProcRules()...)
+
 	// 架构专属项：iopl/ioperm/sysfs 只存在于 x86，写在按架构分文件的
 	// archSpecificRules 里，否则非 x86 平台无法编译（标准库不导出这些常量）。
 	return append(rules, archSpecificRules()...)
@@ -282,14 +292,19 @@ func SeccompFilterRuleNames() []string {
 
 // 已知未覆盖（诚实记录，不假装完整）
 //
-// 下列 Docker default profile 会拦、但标准库未导出 SYS_* 常量的调用，
-// 本实现**没有**拦截（手写各架构号风险高于收益）：
+// 下列 Docker default profile 会拦、但本实现**没有**拦截的调用：
 //
-//	bpf, userfaultfd, kcmp, process_vm_readv/writev,
-//	open_by_handle_at, name_to_handle_at, kexec_file_load,
-//	finit_module, clock_adjtime
+//	bpf, userfaultfd, open_by_handle_at, name_to_handle_at,
+//	kexec_file_load, finit_module, clock_adjtime
 //
 // 其中 bpf 需 CAP_BPF/CAP_SYS_ADMIN、finit_module 需 CAP_SYS_MODULE、
-// process_vm_readv 需 CAP_SYS_PTRACE，而这些能力都已被默认集丢弃，
+// kexec_file_load 需 CAP_SYS_BOOT，而这些能力都已被默认集丢弃，
 // 因此实际风险有限；但这是**纵深防御的第二层**，不应假定它完整。
-// 另外 clone 只拦 CLONE_NEWUSER，未拦 CLONE_NEWPID/NEWNS 等标志组合。
+//
+// v0.9.0 起新增覆盖（原在本清单内，已修）：
+//
+//	process_vm_readv, process_vm_writev, kcmp
+//
+// 仍然只拦 clone(CLONE_NEWUSER)，未拦 CLONE_NEWPID/NEWNS/NEWNET 等标志组合
+// ——这些同样需 CAP_SYS_ADMIN，已在 capability 层丢弃；**不建议**无条件拦
+// clone 的命名空间标志，会破坏 systemd 容器、嵌套构建等合法负载。
