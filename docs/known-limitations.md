@@ -10,18 +10,37 @@
 
 ## L-1 宿主经 `127.0.0.1:<发布端口>` 访问容器不通
 
-**状态**：已知，未修复（v0.9.5 起记录）
+**状态**：已知，未修复（v0.9.5 起记录；2026-10-05 真机复现确认）
 
-### 现象
+### 复现步骤（真机实测，2026-10-05）
+
+在 `45.207.198.91`（Ubuntu，内核 5.15.0-194，root）上：
 
 ```bash
-licore run -d --name web -p 18080:80 nginx:1.27-alpine
-curl http://127.0.0.1:18080/        # ✗ 一直卡住，无响应
-curl http://<宿主 eth0 IP>:18080/   # ✓ HTTP 200
+# 1. 起一个监听端口的容器，发布到宿主 18099
+licore run -d --name pmap-test -p 18099:8099 alpine:3.20.3-amd64 \
+  sh -c 'while true; do { echo -e "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"; } | nc -l -p 8099; done'
+
+# 2. 经宿主**非回环** IP 访问 → 正常
+curl -s -o /dev/null -w 'eth0 -> %{http_code}\n' http://45.207.198.91:18099/
+#   eth0 -> 200                      ✓
+
+# 3. 经宿主**回环**访问 → 卡住直到超时
+curl -s -o /dev/null -w '127.0.0.1 -> %{http_code}\n' http://127.0.0.1:18099/
+#   （无输出，curl 超时退出）          ✗
 ```
 
-容器内自访问正常（`curl http://localhost:80/` 返回页面），外部经宿主公网 IP
-访问也正常。**只有宿主本机走回环地址这一条路径不通。**
+同一次会话内还确认了容器侧网络本身是好的（排除"网络整体不通"）：
+
+```
+容器内 ip route : default via 172.22.0.1 dev vpeXXXX   ✓
+ping 网关       : 0% packet loss                        ✓
+ping 8.8.8.8    : 0% packet loss                        ✓
+nslookup        : example.com 解析成功                   ✓
+```
+
+**即：只有"宿主本机 → 回环地址 → 发布端口"这一条路径不通**，
+其余全部正常。
 
 ### 原因
 
@@ -54,9 +73,9 @@ curl http://<宿主 eth0 IP>:18080/   # ✓ HTTP 200
 **仅限"宿主本机经回环地址访问发布端口"**。以下均不受影响：
 
 - 外部（其它机器）经宿主公网 / 内网 IP 访问端口映射
-- 宿主本机经宿主**非回环** IP 访问端口映射
+- 宿主本机经宿主**非回环** IP 访问端口映射（实测 200）
 - 容器内自访问
-- 容器访问外网
+- 容器访问外网（实测通，含 DNS）
 
 CI / 健康检查脚本若用 `curl localhost:<port>` 探测容器，会失败——改用宿主
 实际 IP 即可。
@@ -67,23 +86,46 @@ CI / 健康检查脚本若用 `curl localhost:<port>` 探测容器，会失败�
 
 1. **`net.ipv4.conf.<bridge>.route_localnet=1`**：允许在网桥上路由
    127.0.0.0/8 的地址。默认 0 时内核会丢弃"源或目的是回环地址却出现在
-   非回环接口上"的报文。
+   非回环接口上"的报文。Docker 在创建网桥时就会设这一项
+   （见 `libnetwork/drivers/bridge`，每个网关接口都开 `route_localnet`）。
 2. **SNAT**：在报文**离开网桥之前**把源地址 127.0.0.1 改写成网桥地址，
-   使容器的回包有真实可路由的目的地址。
+   使容器的回包有真实可路由的目的地址。Docker 用的是
+   `-j MASQUERADE`（在 `POSTROUTING` 阶段，配合 `route_localnet`）。
 
-Docker 用的是 `-j MASQUERADE` 配合 `route_localnet`；本项目的
-`natLoopbackMasqArgs` 已有类似意图，但条件需要按真实报文重写。
+本项目的 `natLoopbackMasqArgs` 已有类似意图，但**条件与实际报文不匹配**
+（命中计数为 0 已证实）。修复时要按真实报文重写规则条件，而不是简单保留
+现有那条。
 
-**注意**：`route_localnet=1` 有安全含义（放宽回环地址的路由限制），
-需要在实现时评估是否只对容器网桥开启。
+**注意**：`route_localnet=1` 有安全含义（放宽回环地址的路由限制，
+使非回环接口上出现 127/8 地址时不再被内核丢弃）。需要在实现时评估是否
+**只对容器网桥**开启、以及是否需要在 `LICORE-INPUT` 侧补充相应限制。
+不要全局开 `net.ipv4.conf.all.route_localnet`。
 
 ### 验证用例（修复后应通过）
 
 ```bash
-licore run -d --name web -p 18080:80 nginx:1.27-alpine
-curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18080/   # 期望 200
+licore run -d --name web -p 18099:8099 alpine:3.20.3-amd64 \
+  sh -c 'while true; do { echo -e "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"; } | nc -l -p 8099; done'
+
+# 回环：修复后应为 200（当前超时）
+curl -sS -o /dev/null -w '127.0.0.1 -> %{http_code}\n' --max-time 5 http://127.0.0.1:18099/
+
+# 非回环：任何时候都应为 200（回归护栏）
+curl -sS -o /dev/null -w 'eth0 -> %{http_code}\n' --max-time 5 http://<宿主IP>:18099/
+
+# 同时确认回环伪装规则的命中计数**非 0**（当前恒为 0）
+sudo iptables -t nat -L LICORE-POST -v -n | grep 127
+sudo nft list chain ip licore post_nat 2>/dev/null
+
 licore stop web && licore rm web
 ```
+
+### 优先级
+
+**不急修**（用户已知悉并接受）。理由：workaround 明确且成本极低——用宿主
+实际 IP 即可，脚本里改一处。但**必须文档化**，否则每个用
+`curl localhost:<port>` 做健康检查的用户都会撞上，且表现为"连接超时"，
+极易误判成容器没起来或引擎有严重问题。
 
 ---
 
