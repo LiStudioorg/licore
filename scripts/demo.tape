@@ -32,18 +32,25 @@ Type "cd /tmp/licore-demo"
 Enter
 Sleep 1s
 
-# —— 引擎信息：单二进制，无守护进程 ——
-Type "licore --version"
-Enter
-Sleep 1.8s
+# 注：这里刻意**不**演示 `licore --version`。
+# 原因：GIF 会固化版本号，每次发版就与画面不符（如刚发布的 v0.9.2/0.9.3），
+# 演示资源"看一次就过期"。改为直接从 pull 开始——这些命令本身不随版本变化，
+# 录一次可长期复用。
 
 # —— 导入 .licore 镜像（本地文件，离线；全部层摘要校验）——
 Type "licore pull ./demo.licore"
 Enter
 Sleep 2.2s
 
-# —— 后台启动：-d 交给 shim 持有，-p 发布端口 ——
-Type "licore run -d --name demo -p 18080:8080 demo:v1"
+# —— 后台启动：-d 交给 shim 持有，-p 发布端口，--memory 设内存上限 ——
+#
+# `--memory 256` 不是随便加的，两个作用：
+#   1. **消掉未设限额时的 WARN**——不设 --memory 会打一条 slog.Warn
+#      （"容器可耗尽宿主内存并触发宿主 OOM killer"），在演示里占 4 行、
+#      把画面节奏打乱；
+#   2. **演示生产推荐用法**——README《默认无内存限额》一节要求生产环境
+#      显式指定 --memory，演示里就该这么写，顺带把这条最佳实践展示出来。
+Type "licore run -d --name demo -p 18080:8080 --memory 256 demo:v1"
 Enter
 Sleep 2.5s
 
