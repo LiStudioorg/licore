@@ -458,11 +458,12 @@ licore boot disable                       # 移除系统服务
 ### 已知限制
 
 > 同样来自真机实测；**未修复之前不会从这里删掉**。
+> 完整的限制清单（含原因与修复方向）见 [docs/known-limitations.md](docs/known-limitations.md)。
 
-- **`-p` 端口映射依赖宿主的 FORWARD 链**：若宿主 `iptables` FORWARD 策略为 `DROP`
-  且没有放行 licore 网桥的规则（部分云主机、启用 rootless-docker 的机器如此），
-  `-p` 发布的端口从宿主外部不可达。这与 Docker 在同一台机器上的行为一致；此时
-  licore 会打印告警，容器间通信与出网不受影响。可用 `licore network ls` 确认网桥状态。
+- **宿主经 `127.0.0.1:<发布端口>` 访问容器不通**：经宿主 eth0 IP 或外部 IP
+  访问正常，容器内自访问也正常——**只有宿主本机走回环地址这一条路径不通**。
+  原因是 DNAT 只改目的地址，容器回包时看到目的地址是 `127.0.0.1`，按路由
+  发往容器自己的 `lo`。详见 [docs/known-limitations.md](docs/known-limitations.md#l-1-宿主经-127001发布端口访问容器不通)。
 - **`exec` 依赖系统 `nsenter`**：util-linux（Linux）、Toybox（Android 10+）自带；
   旧版 Android 需装 busybox。缺失时 `licore exec` 返回带安装指引的明确错误，
   其余功能完全不受影响。macOS / Windows 上 `exec` 不可用（需在 VM / WSL2 内运行）。
