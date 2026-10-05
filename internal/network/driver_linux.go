@@ -107,6 +107,19 @@ func nftCreateTables() error {
 	return nil
 }
 
+// nftDropTables 删除 LiCore 自建的 nft 表（幂等；表不存在时静默通过）。
+//
+// 用于 nft 路径**部分失败后的清理**：nftCreateTables 会先把表和三条链建好，
+// 若随后的规则写入失败（如本机 masquerade 不受支持），那张表就**残留**下来
+// ——空的三条链虽无功能影响，但会让"nft 表是否存在"这类诊断产生误导，
+// 也污染宿主规则集。
+//
+// 真机实测确认过这个残留：nft 路径失败后 `nft list tables` 里仍有
+// `table ip licore`（0 条规则）。
+func nftDropTables() {
+	_ = runNft("delete", "table", "ip", "licore")
+}
+
 // nftIdempotentMarkers 是"重复操作"类错误的识别串。
 //
 // **不要往里加 "No such file or directory"**：nft 在**缺少内核特性**时
@@ -212,13 +225,20 @@ func (n *Network) applyPortRules() error {
 		// 直接返回原错误，避免把同一个权限问题重演一遍后给出误导性报错。
 		return nftErr
 	} else if !iptablesAvailable() {
+		// nft 失败且无回退可用：清掉 nft 可能已建的表再报错。
+		nftDropTables()
 		return fmt.Errorf("%w；nft 失败原因: %v；iptables 也不可用（未安装），"+
 			"请安装 nftables（推荐，需内核支持 masquerade）或 iptables",
 			ErrBothBackendsFailed, nftErr)
 	} else if iptErr := n.applyPortRulesIptables(); iptErr != nil {
+		nftDropTables()
 		return fmt.Errorf("%w；nft 失败: %v；iptables 回退也失败: %w",
 			ErrBothBackendsFailed, nftErr, iptErr)
 	} else {
+		// **nft 失败但 iptables 成功**：nft 可能已建了一半（表和链成功、
+		// 规则失败），必须清掉，否则残留一张空的 `ip licore` 表。
+		// 真机实测确认过这个残留。
+		nftDropTables()
 		slog.Info("nft 不可用，NAT 已回退到 iptables",
 			slog.String("net", n.Name), slog.Any("nft_err", nftErr))
 		n.NATBackend = natBackendIptables.String()
