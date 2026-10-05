@@ -59,6 +59,16 @@ func (a *Authenticator) Sign(user string, scopes []string) (string, error) {
 }
 
 // Verify 校验令牌并返回其声明。非法/过期返回 ErrUnauthorized。
+//
+// 校验项（缺一不可）：
+//   - 三段结构、签名（恒定时间比较）、声明可解析；
+//   - **exp 必须存在且为正数**——缺失即拒绝；
+//   - **iat 不得晚于当前时间**（防"未来签发"的令牌）。
+//
+// 为什么 exp 缺失必须拒绝：曾经写的是 `if c.Exp > 0 && now > c.Exp`，
+// 那个 `c.Exp > 0` 前置条件让 exp=0（缺失）与 exp<0 的令牌**永远不做过期
+// 校验**，配合可预测密钥即可伪造出永久有效的 admin 令牌
+// （docs/security-audit-v2.md M-2）。"没写 exp"不等于"永不过期"。
 func (a *Authenticator) Verify(token string) (*JWTClaims, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
@@ -77,8 +87,18 @@ func (a *Authenticator) Verify(token string) (*JWTClaims, error) {
 	if err := json.Unmarshal(claimBytes, &c); err != nil {
 		return nil, fmt.Errorf("解析 JWT 声明: %w", ErrUnauthorized)
 	}
-	if c.Exp > 0 && time.Now().Unix() > c.Exp {
+	// exp 缺失或非正数一律拒绝：不存在"不过期的令牌"。
+	if c.Exp <= 0 {
+		return nil, fmt.Errorf("JWT 缺少合法 exp（必须为正数）: %w", ErrUnauthorized)
+	}
+	now := time.Now().Unix()
+	if now > c.Exp {
 		return nil, fmt.Errorf("JWT 已过期: %w", ErrUnauthorized)
+	}
+	// iat 为 0（缺失）容忍——它只用于防未来令牌，缺失不构成安全风险；
+	// 但若显式给了未来时间，说明令牌可疑，拒绝。
+	if c.Iat > now {
+		return nil, fmt.Errorf("JWT iat 晚于当前时间: %w", ErrUnauthorized)
 	}
 	return &c, nil
 }

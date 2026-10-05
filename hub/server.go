@@ -4,13 +4,14 @@
 package hub
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 )
@@ -36,9 +37,14 @@ func NewServer(reg *Registry, opts ...ServerOption) (*Server, error) {
 	if reg == nil {
 		return nil, fmt.Errorf("registry 不能为空")
 	}
+	// 默认密钥必须是密码学随机的；生成失败即启动失败（见 randSecret 说明）。
+	secret, err := randSecret()
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
 		reg:   reg,
-		auth:  NewAuthenticator(randSecret(), 24*time.Hour),
+		auth:  NewAuthenticator(secret, 24*time.Hour),
 		users: map[string]string{},
 	}
 	for _, o := range opts {
@@ -290,7 +296,23 @@ func writeErr(w http.ResponseWriter, code int, err error) {
 }
 
 // randSecret 生成一个会话级随机密钥（登录/签名用）。
-// 生产环境应通过 WithAuth 注入稳定 secret，避免重启后令牌全部失效。
-func randSecret() string {
-	return fmt.Sprintf("licore-hub-%d-%d", os.Getpid(), time.Now().UnixNano())
+//
+// **必须用 crypto/rand**：此前是 `fmt.Sprintf("licore-hub-%d-%d", os.Getpid(),
+// time.Now().UnixNano())` —— 那不是随机数，而是"PID + 启动纳秒"，
+// 两者都可被攻击者获取/枚举，据此可离线伪造出任意 admin 令牌
+// （docs/security-audit-v2.md M-1）。
+//
+// 语义保持"会话级"：不落盘、进程重启即换新密钥，因此重启后旧令牌全部失效。
+// 这是有意的取舍——持久化密钥需要落到磁盘上，反而引入新的保管问题；
+// 需要跨重启稳定的部署应显式通过 WithAuth 注入。
+//
+// 返回 (secret, error)：**crypto/rand 失败时必须让启动失败**，不能回退到
+// 时间戳之类的弱熵源。弱密钥是静默的灾难——服务照常起来，攻击者却能伪造
+// 令牌，没有任何症状。
+func randSecret() (string, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("生成 hub 会话密钥失败（crypto/rand 不可用）: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:]), nil
 }

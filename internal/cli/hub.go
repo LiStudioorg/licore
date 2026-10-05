@@ -90,7 +90,18 @@ func newHubServeCommand(out io.Writer) *cobra.Command {
 
 			addr := net.JoinHostPort(bind, fmt.Sprintf("%d", port))
 			handler := srv.Handler()
-			httpSrv := &http.Server{Addr: addr, Handler: handler}
+			// 超时必须显式设置：零值意味着**永不超时**，慢速连接（Slowloris）
+			// 可以一直占着 goroutine 与 fd 不放，把服务拖垮。
+			// ReadHeaderTimeout 是这里最关键的一条——它限制"发完请求头"的时间，
+			// 正是 Slowloris 利用的窗口（docs/security-audit-v2.md G110/G112）。
+			httpSrv := &http.Server{
+				Addr:              addr,
+				Handler:           handler,
+				ReadHeaderTimeout: 10 * time.Second,
+				ReadTimeout:       60 * time.Second,
+				WriteTimeout:      5 * time.Minute, // blob 上传/下载可能很大
+				IdleTimeout:       2 * time.Minute,
+			}
 
 			// 前台服务：信号触发优雅关闭。
 			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
