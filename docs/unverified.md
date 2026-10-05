@@ -23,6 +23,14 @@
 | P0-2 capability 裁剪 | ✅ | ⚠️ 仅纯逻辑与 ABI | ✅ **已真机验证** |
 | P1 seccomp 黑名单 | ✅ | ✅ 已验 | ✅ **已真机验证** |
 | exec 收口（bind helper） | ✅ | ⚠️ 部分 | ✅ **已真机验证** |
+| `/proc/sys` 只读 + sysrq mask | ✅ | ✅ 已验（单测） | ✅ **已真机验证**（2026-10-05） |
+
+> **2026-10-05 真机补测发现并修复 P0**：容器内可写穿宿主 `/proc/sysrq-trigger`、
+> `/proc/sys/kernel/core_pattern`、`/proc/sys/kernel/modprobe`。根因是这三个文件
+> 的内核 handler 走 `proc_dostring`、**不做 `capable()` 检查**，只依赖 DAC，
+> 而容器 init 是真正的宿主 uid 0 —— capability 裁剪与 seccomp 对它们均无效。
+> 已改为 `/proc/sys` 整体只读重挂 + 单独 mask `/proc/sysrq-trigger`，
+> 真机复测三条全部 `denied`。详见 [docs/escape-audit.md](escape-audit.md) §2.A。
 
 > **2026-10-04 真机验证通过**（Linux 服务器，root）。容器 PID 1 与 exec 进程均为
 > `CapEff=00000000a80425fb`（不含 CAP_SYS_ADMIN）、`NoNewPrivs=1`、`Seccomp=2`；

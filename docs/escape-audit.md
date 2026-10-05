@@ -136,24 +136,65 @@ finit_module, clock_adjtime`，以及 `clone` 的 `NEWPID/NEWNS` 等标志组合
 
 ### A. 内核接口直写
 
-| # | 路径 | 所需能力 | 判定 | 依据 |
-| --- | --- | --- | --- | --- |
-| A1 | `/proc/sysrq-trigger` | `CAP_SYS_ADMIN` | ✅ 拦 | 默认集无 SYS_ADMIN |
-| A2 | `/proc/sys/kernel/*` 写 | 视文件：多数 `CAP_SYS_ADMIN`，`dmesg_restrict` 等 | ✅ 拦 | 同上；`kptr_restrict` 需 `CAP_SYS_ADMIN` |
-| A3 | `/proc/sys/vm/*` 写 | `CAP_SYS_ADMIN` | ✅ 拦 | 同上 |
-| A4 | `/proc/sys/net/*` 写（宿主 netns 时） | `CAP_NET_ADMIN` | ✅ 拦 | 默认集无 NET_ADMIN |
-| A5 | `/sys/kernel/uevent_helper` 写 | `CAP_SYS_ADMIN` | ✅ 拦 | 同上 |
-| A6 | `/sys/kernel/kexec*` | `CAP_SYS_BOOT` | ✅ 拦（双保险） | 无 SYS_BOOT + seccomp 拦 `kexec_load` |
-| A7 | `/sys/kernel/reboot` | `CAP_SYS_BOOT` | ✅ 拦（双保险） | 无 SYS_BOOT + seccomp 拦 `reboot` |
-| A8 | `/sys/module/*/parameters/*` 写 | `CAP_SYS_ADMIN` | ✅ 拦 | 同 A1 |
-| A9 | `/sys/class/*/uevent` 写（触发 udev） | `CAP_SYS_ADMIN` | ✅ 拦 | 同上 |
-| A10 | `/sys/fs/cgroup/*` 写 | 通常 root + cgroup 权限 | ⚠️ **纵深不足，待实测** | 见 §4-P2-1：容器未挂载独立 cgroup ns |
-| A11 | `/proc/acpi/*`、`/proc/apm` | `CAP_SYS_ADMIN` / 只读 | ✅ 拦 | 写需 SYS_ADMIN |
-| A12 | `/proc/sys/kernel/modprobe` 写（经典提权） | `CAP_SYS_ADMIN` | ✅ 拦（双保险） | 无 SYS_ADMIN + seccomp 拦 `init_module` |
-| A13 | `/proc/sys/kernel/core_pattern` 写（经典逃逸） | `CAP_SYS_ADMIN` | ✅ 拦 | 同 A1 |
+> **⚠️ 本节已被真机实测推翻并重写（2026-10-05）。**
+>
+> 第一版判定依据是"这些接口都需要 `CAP_SYS_ADMIN`，而默认集已丢弃它"。
+> **这个推理是错的**，实测发现三条可写路径（P0，见 §4）。教训：
+> **从能力集推断"某接口被挡住"是无效的**——procfs 下有一大批文件的
+> 内核 handler 只依赖 inode 的 DAC 权限，**不做 `capable()` 检查**。
+> 容器 init 是真正的宿主 uid 0，DAC 因此直接放行。
 
-**A 类小结**：全部依赖 `CAP_SYS_ADMIN`，而默认集刻意不含它，因此 A 类整体被
-capability 裁剪覆盖。seccomp 在此是**第二层**（对 A6/A7/A12 形成双保险）。
+#### A.1 实测结果（真机，alpine 3.20.3，`CapEff=00000000a80425fb`）
+
+| # | 路径 | 修复前 | 修复后 | 内核 handler |
+| --- | --- | --- | --- | --- |
+| A1 | `/proc/sysrq-trigger` | 🔴 **WRITE-OK** | ✅ denied | `proc_dostring`，仅 DAC |
+| A2 | `/proc/sys/kernel/core_pattern` | 🔴 **WRITE-OK** | ✅ denied | `proc_dostring`，仅 DAC |
+| A3 | `/proc/sys/kernel/modprobe` | 🔴 **WRITE-OK** | ✅ denied | `proc_dostring`，仅 DAC |
+| A4 | `/proc/sys/kernel/kptr_restrict` | ✅ denied | ✅ denied | `proc_dointvec_*`，内部 `capable()` |
+| A5 | `/proc/sys/vm/drop_caches` | ✅ denied | ✅ denied | `proc_dointvec_*`，内部 `capable()` |
+| A6 | `/proc/mtrr` | ✅ denied | ✅ denied | 内核自身检查 |
+| A7 | `/proc/kmsg`、`kcore`、`kallsyms`、`kpageflags` | ✅ denied | ✅ denied | 内核自身检查 |
+| A8 | `/proc/sys/*` 其余项 | — | ✅ denied（整体 ro） | 挂载层 |
+
+**A1/A2/A3 的破坏力**：
+
+- **A1 `/proc/sysrq-trigger`**：写 `b` → **立即重启宿主**；写 `c` → 触发崩溃转储。
+  这正是 AGENTS.md《操作规范》里记录的真机事故路径。
+- **A2 `/proc/sys/kernel/core_pattern`**：写 `|/path/to/cmd` → 任何进程崩溃时
+  **以内核身份（宿主 root）执行该命令**。容器 → 宿主 root 的直通管道。
+- **A3 `/proc/sys/kernel/modprobe`**：改写模块加载路径，配合需要模块加载的场景
+  可劫持为任意程序。
+
+**真写穿的证据**（不是静默丢弃）：容器内写 `core_pattern` 返回 `rc=0`，
+**在宿主上读该文件确认内容已被改写**。审计过程中此操作污染了宿主值，
+事后已用 `sysctl -w kernel.core_pattern=core` 恢复（见 §8.6）。
+
+#### A.2 为什么 capability 与 seccomp 都挡不住
+
+| 层 | 为什么无效 |
+| --- | --- |
+| capability 裁剪 | 这些文件只做 DAC 检查。容器 init 是宿主 uid 0，inode 属 root、模式 0600/0644 → **DAC 通过**。`CAP_SYS_ADMIN` 丢没丢无关 |
+| seccomp | 这是 `open()` + `write()` 两个通用系统调用，**没有专用 syscall 号可拦**。拦 `open`/`write` 会打断容器内一切正常 I/O |
+| SELinux | 仅继承 exec 上下文，非强制策略（见 §7.1） |
+
+#### A.3 修复（commit `c25b9cc`）
+
+两处，时机都在 `/proc` 挂好之后、`pivot_root` 之前：
+
+1. **`mountProcSysReadOnly`**：`/proc/sys` 整体先 `MS_BIND`，
+   再 `MS_REMOUNT|MS_BIND|MS_RDONLY`。`open(O_WRONLY)` 在 VFS 层即被拒。
+2. **`maskProcRootFiles`**：`/proc/sysrq-trigger` **不在** `/proc/sys/` 目录内
+   ——**第一版修复正是因此漏掉它**，实测确认第 1 步之后它仍可写。
+   故用 rootfs 内自建的 `0400` 空文件 bind 覆盖，再 remount 只读。
+
+两处均**返回错误而非静默降级**：封堵失败 = 容器带着 P0 路径启动，
+必须让启动失败。
+
+**为什么选挂载层而不是"危险文件清单"**：挂载层与"该内核接口是否做了
+能力检查"无关，也不需随内核版本维护清单——本次审计已经证明，靠推断
+清单（第一版 §2.A）会漏。
+
 
 ---
 
@@ -463,18 +504,27 @@ init_linux.go:517 — `mountRaw(src, dst, "", msBind, "")`，**只有 MS_BIND，
 
 ### 🔴 P0：能直接破坏宿主
 
-**当前枚举：0 项确认为 P0。**
+**3 项确认并已修复（真机实测，2026-10-05）。**
 
-代码级分析未发现可直接破坏宿主的路径。所有"直写内核接口"类（A 类）均被
-`CAP_SYS_ADMIN` 裁剪覆盖，且部分有 seccomp 双保险。
+| ID | 路径 | 影响 | 状态 |
+| --- | --- | --- | --- |
+| **P0-1** | `/proc/sysrq-trigger` 可写 | 写 `b` **立即重启宿主**（AGENTS.md 记录的真机事故路径） | ✅ 已修（`c25b9cc`） |
+| **P0-2** | `/proc/sys/kernel/core_pattern` 可写 | 写 `\|cmd` → 崩溃时**以内核身份执行任意命令** | ✅ 已修（`c25b9cc`） |
+| **P0-3** | `/proc/sys/kernel/modprobe` 可写 | 劫持内核模块加载路径 | ✅ 已修（`c25b9cc`） |
 
-**但有一项配置层面的 P0 候选**：
+**共同根因**：这三个文件的内核 handler 走 `proc_dostring`，**不做 `capable()`
+检查**，只依赖 inode 的 DAC 权限；而容器 init 是真正的宿主 uid 0，DAC 直接放行。
+因此"丢了 `CAP_SYS_ADMIN`"对它们完全无效。seccomp 也无效（`open`+`write` 无专用
+系统调用号）。→ 详细分析见 §2.A。
+
+**修复**：`/proc/sys` 整体只读重挂 + `/proc/sysrq-trigger` 单独 mask（§2.A 的 A.3）。
+真机复测三条全部 `denied`，且宿主 `core_pattern` 未被改动、容器封印状态无变化。
+
+另有 1 项**配置层面**的 P0 候选（非隔离绕过）：
 
 - **P0-候选-1（I7）**：**无内存限额时容器可触发宿主 OOM killer**，杀死宿主上的
-  其他进程。这不是"隔离绕过"，是默认配置的 DoS 面。用户的任务定义为
-  "能破坏/影响宿主机的路径"——**这符合定义**。
-  - 是修（默认限额）还是记录（文档警示）？**需要用户决策**，因为改默认限额会
-    偏离 Docker 语义并可能破坏合法的大内存负载。
+  其他进程。已按决策 5 处理：不改默认限额，改为 README 警示 + `run` 时
+  `slog.Warn`，并在 §8.4 记录为设计选择。
 
 ### 🟠 P1：能逃逸隔离 / 读宿主敏感信息
 
@@ -488,8 +538,18 @@ init_linux.go:517 — `mountRaw(src, dst, "", msBind, "")`，**只有 MS_BIND，
 
 ### 🟡 P2：信息泄露 / 纵深不足
 
-- **P2-1（A10/F1/F4）**：cgroupfs 在容器内的可见性未确认——**审计缺口**，
-  需实测闭环。
+- **P2-1（A10/F1/F4）**：cgroupfs 在容器内的可见性 —— ✅ **已实测闭环，非漏洞**。
+  真机确认：容器内 `/sys/fs/cgroup` **不存在**（`ls` 返回 `No such file or directory`），
+  且 `/sys` 目录为空、镜像 rootfs 未预置该路径。
+  写测试：`touch /sys/fs/cgroup/test` → `No such file or directory`，**不可写**。
+  即容器完全看不到 cgroupfs，F1/F4 没有落点。原因：LiCore 的资源限制由
+  `internal/resource` 在**宿主侧**写入 cgroup，容器内不挂载 cgroupfs。
+  → F 类整体判定由 ⏳ 改为 ✅。
+
+  注：`/proc/self/cgroup` 仍可读，返回 `0::/user.slice/user-0.slice/session-7.scope`
+  ——这是**宿主 session 的路径**，而非容器专属 cgroup 路径。说明容器并未被放入
+  独立 cgroup 路径视图。严重度低（仅信息泄露），但记录：它泄露的是宿主路径结构。
+
 - **P2-2（E2/E7）**：`process_vm_readv`/`process_vm_writev`/`kcmp` **seccomp 未拦**。
   当前靠"`CAP_SYS_PTRACE` 已丢 + 宿主进程不可见"防护。**风险**：一旦用户
   `--cap-add SYS_PTRACE`，这两条**立刻失去 seccomp 兜底**（`ptrace` 有兜底，
@@ -657,11 +717,53 @@ R-6 ✅ 已完成（本文档）；R-1 / R-3 / R-5 ⏳ 待实测结果决定。
 只判 `== 0` 会让负数静默绕过告警——单测 `TestWarnNegativeMemoryTreatedAsUnlimited`
 专门锁死这条边界。
 
-### 8.5 下一步
+### 8.5 真机实测结果（2026-10-05，本轮已执行）
 
-1. **等用户解除 8.2 的阻塞**（或指定由用户自己在服务器上跑）；
-2. 解除后按 §5.2 清单执行实测，**先只读、破坏性单独一条 + 先问**；
-3. 按实测结果修订 §4 漏洞清单（能穿透的升级为 P0/P1，被证伪的降级并说明）；
-4. T-I 严格按决策 3：**带 `--memory` 测限额生效**，不测能否打挂宿主；
-5. 更新本文档与 `docs/unverified.md` 的真机验证状态。
+**8.2 的阻塞已解除**：会话的 `NoNewPrivs` 变为 0、`sudo` 可用，实测得以在
+本机（物理服务器 `45.207.198.91`，内核 `5.15.0-194-generic`）执行。
+
+实测方式：用新编译的 licore 起独立容器 `sectest`（`--memory 256`，
+alpine 3.20.3-amd64），逐条只读探测 + 写入测试。**全程未触碰
+`swift_puma` 及任何其它容器**；测试容器已 `stop` + `rm` 清理。
+
+| 类别 | 结果 |
+| --- | --- |
+| **A 内核接口** | 🔴 **发现 3 条 P0 可写路径**（sysrq-trigger / core_pattern / modprobe）；已修复并复测通过 |
+| **B 设备节点** | ✅ 容器内 `/dev` 仅 7 个允许节点；`mknod` 可造节点但**打开被拒**（`/dev/mem`、`kmem`、`port`、`kmsg`、`fuse` 全部 denied）→ B8 判定由 ⏳ 改为 ✅ |
+| **C 命名空间** | ✅ `unshare -U` 返回 `EPERM`；`/proc` 仅见容器内 4 个进程；`NSpid` 显示独立 PID ns |
+| **D 挂载** | ✅ 容器内挂载表仅 12 项，全部为容器自身；旧根已消失 |
+| **E 进程侧信道** | ✅ 宿主进程不可见（独立 PID ns） |
+| **F cgroup** | ✅ **已闭环**：容器内 `/sys/fs/cgroup` 不存在，不可写（详见 P2-1） |
+| **G 文件系统** | ✅ `/` 为容器 rootfs；`/.licore/exec-helper` 确为 `ro` 挂载 |
+| **H 网络** | ✅ 独立 netns（`vpe*` veth + 172.22.0.3/16），需 `nc` 的宿主回环测试未完成 |
+| **I 资源** | ⏳ T-I 限额生效测试**尚未执行**（见下） |
+
+**封印状态复测**（修复后）：容器 PID1 与 `exec` 路径均为
+`CapEff=00000000a80425fb`（无 `CAP_SYS_ADMIN`）、`NoNewPrivs=1`、`Seccomp=2`
+——与 v0.9.0 期望一致，本次修复未影响封印。
+
+**未完成项**：T-I（`--memory 256` 限额生效测试）本轮未跑，需单独执行。
+注意 `--memory` 取整数 MiB（`--memory 256`），**不接受 `256m` 后缀**。
+
+### 8.6 审计过程对宿主的影响与恢复（诚实记录）
+
+审计中为验证"是否真写穿"（而非静默丢弃），在容器内写过
+`/proc/sys/kernel/core_pattern`，**确认宿主该文件被真实改写**。
+
+- 该写入污染了宿主值，事后已用 `sudo sysctl -w kernel.core_pattern=core`
+  恢复为 Ubuntu 默认值 `core`，并复读确认。
+- **未执行**的高危操作：`echo b > /proc/sysrq-trigger`（会重启宿主）、
+  任何 kexec / 模块加载 / `/dev/mem` 读写。写入 `rc=0` 已足以证明漏洞存在，
+  触发它不会增加证据、只会危及生产机。
+- 唯一被触碰的宿主全局状态就是 `core_pattern`，已恢复。
+
+### 8.7 下一步
+
+1. **T-I 限额生效测试**（`--memory 256` + 容器内撑内存 → 容器被 OOM kill、
+   宿主不受影响）——严格按决策 3，**不测**能否打挂宿主；
+2. **R-3**（`clone` 命名空间标志）与 **R-5**（cgroupfs）按本轮实测结论重新评估：
+   R-5 已确认**无需实施**（容器看不到 cgroupfs）；R-3 仍按"C9 需 `CAP_SYS_ADMIN`
+   已丢"维持现状，不建议无条件拦（会破坏合法负载）；
+3. **H 类补测**：安装 `nc` 或用其它方式确认容器→宿主回环不可达；
+4. 复核 §7「已知限制」中本轮已被证伪/证实的条目。
 

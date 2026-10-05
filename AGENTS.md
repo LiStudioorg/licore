@@ -340,6 +340,43 @@ CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o licore-darwin-arm64 .
 | 4 | SELinux exec 上下文（仅继承，非强制） | `inheritSELinuxContext()` |
 | 5 | `execve` | — |
 
+### 第四层：procfs 挂载层封堵（v0.9.1 起）
+
+**capability 与 seccomp 都挡不住 procfs 的一部分接口，必须靠挂载层。**
+这是 2026-10-05 真机实测的结论，也是本节最容易被误解的一处。
+
+**根因**：容器 init 是**真正的宿主 uid 0**（上面说的"不加 `CLONE_NEWUSER`"）。
+`/proc` 下有一批文件的内核 handler 走 `proc_dostring`，**不做 `capable()`
+检查**，只依赖 inode 的 DAC 权限（属 root、模式 0600/0644）。容器在 DAC 上
+等于宿主 root，于是**直接写穿**：
+
+| 路径 | 写下去的后果 |
+| --- | --- |
+| `/proc/sysrq-trigger` | 写 `b` **立即重启宿主** |
+| `/proc/sys/kernel/core_pattern` | 写 `\|cmd` → 崩溃时**以内核身份执行命令** |
+| `/proc/sys/kernel/modprobe` | 劫持内核模块加载路径 |
+
+对照实验（同一容器，`CapEff` 已无 `CAP_SYS_ADMIN`）：
+
+- `kptr_restrict` / `drop_caches` → **denied**（走 `proc_dointvec_*`，内部 `capable()`）
+- 上表三条 → **WRITE-OK**（走 `proc_dostring`，仅 DAC）
+
+**因此：不要从"某能力已丢弃"推断"某内核接口被挡住"。** 对 procfs 这类接口，
+能力裁剪是无效的，seccomp 也无效（是 `open`+`write`，没有专用系统调用号）。
+**唯一可靠的判据是真机实测写入。**
+
+**封堵方式**（`init_linux.go`，都在 `/proc` 挂好之后、`pivot_root` 之前）：
+
+1. `mountProcSysReadOnly`：`/proc/sys` 整体先 `MS_BIND`，再
+   `MS_REMOUNT|MS_BIND|MS_RDONLY`；
+2. `maskProcRootFiles`：`/proc/sysrq-trigger` **不在 `/proc/sys/` 目录内**，
+   第 1 步覆盖不到，须用 rootfs 内自建的空 `0400` 文件 bind 覆盖再 remount 只读。
+
+两处**失败必须返回错误**，不允许降级——封堵失败等于容器带着 P0 路径启动。
+
+新增同类封堵时：**先真机实测确认可写，再进清单**。凭推断扩大清单会误伤
+合法用法（`/proc` 根下多数写敏感文件实测已被内核拒绝）。
+
 ### 三条不可违反的约束
 
 1. **收口位置必须在所有特权准备之后、`execve` 之前。**
@@ -404,9 +441,17 @@ no_new_privs → capability 裁剪 → seccomp。
 ### 已知缺口（不要假定容器已完全隔离）
 
 - 无 AppArmor / SELinux 强制策略。
-- seccomp 是**黑名单**，不拦未知系统调用；`bpf` / `userfaultfd` / `kcmp` /
-  `process_vm_readv` / `open_by_handle_at` / `finit_module` 等未列入
-  （标准库未导出常量，手写各架构号的风险高于收益）。
+- seccomp 是**黑名单**，不拦未知系统调用；`bpf` / `userfaultfd` /
+  `open_by_handle_at` / `name_to_handle_at` / `kexec_file_load` /
+  `finit_module` / `clock_adjtime` 未列入（标准库未导出常量）。
+  `kcmp` / `process_vm_readv` / `process_vm_writev` 已于 v0.9.1 补齐
+  （见 `seccomp_vmproc_*_linux.go`）。
+- `clone` 只拦 `CLONE_NEWUSER`，未拦 `CLONE_NEWPID/NEWNS/NEWNET` 等标志组合
+  ——这些需 `CAP_SYS_ADMIN`（已丢），且无条件拦会破坏 systemd 容器、
+  嵌套构建等合法负载，故**有意不拦**。
+- **本节的教训（2026-10-05）**：不要从"某能力已丢弃"推断"某内核接口被挡住"。
+  procfs 有一批接口只做 DAC 检查，能力裁剪对它们无效——详见上一节
+  《第四层：procfs 挂载层封堵》。
 
 ### 验证
 
