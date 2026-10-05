@@ -24,6 +24,7 @@
 | P1 seccomp 黑名单 | ✅ | ✅ 已验 | ✅ **已真机验证** |
 | exec 收口（bind helper） | ✅ | ⚠️ 部分 | ✅ **已真机验证** |
 | `/proc/sys` 只读 + sysrq mask | ✅ | ✅ 已验（单测） | ✅ **已真机验证**（2026-10-05） |
+| exec 进程归入容器 cgroup | ✅ | ✅ 已验（单测） | ✅ **已真机验证**（2026-10-05） |
 
 > **2026-10-05 真机补测发现并修复 P0**：容器内可写穿宿主 `/proc/sysrq-trigger`、
 > `/proc/sys/kernel/core_pattern`、`/proc/sys/kernel/modprobe`。根因是这三个文件
@@ -31,6 +32,14 @@
 > 而容器 init 是真正的宿主 uid 0 —— capability 裁剪与 seccomp 对它们均无效。
 > 已改为 `/proc/sys` 整体只读重挂 + 单独 mask `/proc/sysrq-trigger`，
 > 真机复测三条全部 `denied`。详见 [docs/escape-audit.md](escape-audit.md) §2.A。
+
+> **2026-10-05 修复 exec 绕过资源限额（v0.9.2）**：`licore exec` 的进程原先
+> 落在调用者（CLI）的 cgroup（`user.slice/...session-N.scope`），而非容器的
+> `/licore/<id>`，因此**完全绕过 `--memory` / `--pids-limit`**。实测容器限额
+> 256 MiB，exec 进去的进程吃到 400 MiB 也不被拦。修复采用
+> `clone3(CLONE_INTO_CGROUP)`（原子，无竞态）+ 写 `cgroup.procs` 回退；
+> 真机复测 `cat /proc/self/cgroup` → `0::/licore/<CID>`，
+> 且 exec 进程的内存被计入并压在上限内。详见 §2.I 的 I8。
 
 > **2026-10-04 真机验证通过**（Linux 服务器，root）。容器 PID 1 与 exec 进程均为
 > `CapEff=00000000a80425fb`（不含 CAP_SYS_ADMIN）、`NoNewPrivs=1`、`Seccomp=2`；

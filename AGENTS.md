@@ -643,8 +643,27 @@ type ExecOptions struct {
     User      string       // uid[:gid]
     Stdin, Stdout, Stderr  *os.File
     TTY       bool         // -t：伪终端
+    CgroupID  string       // 容器 ID；v0.9.2 新增，见下
 }
 ```
+
+- **`ExecOptions.CgroupID`（v0.9.2 新增）**：把 exec 进程放入容器的
+  `/licore/<id>` cgroup。**为空时跳过归置**，此时 exec 进程不受容器资源限额
+  约束。`internal/cli` 恒传 `cfg.ID`。
+  - **为什么必须有**：exec 走宿主侧 nsenter，新进程默认继承**调用者（CLI）**
+    的 cgroup——实测为 `user.slice/user-0.slice/session-N.scope`，从而
+    **完全绕过 `--memory` / `--pids-limit`**。实测容器限额 256 MiB，
+    exec 进去的进程吃到 400 MiB 也不被拦。
+  - **实现要点（安全属性）**：优先 `SysProcAttr.CgroupFD` + `UseCgroupFD`
+    （clone3 的 `CLONE_INTO_CGROUP`），让 nsenter **出生即在容器 cgroup**，
+    无竞态；clone3 不可用时回退写 `cgroup.procs`——**该回退有竞态**，因为
+    nsenter 会 setns 并 fork，而写 `cgroup.procs` 只迁移自身与线程、
+    **不迁移已 fork 的子进程**。
+  - **失败必须报错，不许静默跳过**：静默跳过等于退回"exec 不受限额"。
+  - 路径复用 `internal/resource` 的 `CgroupV2Mount` / `LiCoreGroup` 常量，
+    **不要硬编码**——那是跨模块契约，失配的后果正是 exec 悄悄失去限额。
+- `execns.Enter` 同步新增 `cgroupDir string` 参数；非 Linux stub 保持同签名
+  （跨平台交叉编译需要）。
 
 - `Exec` 由 `licore exec` 调用；非 Linux 后端提供同签名 stub（返回 ErrUnsupported）。
 - 网络/卷/资源装配通过内部 `LICORE_NET_*` / `LICORE_MOUNT_*` / `LICORE_CGROUP_ID` 环境变量
