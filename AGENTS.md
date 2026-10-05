@@ -31,6 +31,40 @@ LiCore 是一个用 Go 编写的**轻量级容器引擎**，使用场景类似 D
 
 ## 发行注意事项
 
+### Gitea 镜像站没有 Actions，Release 必须手动同步
+
+本仓库同时推送到两个远端：
+
+| 远端 | 地址 | 用途 |
+| --- | --- | --- |
+| `origin` | GitHub `LiStudioorg/licore` | **主仓库**：CI、Release、安装脚本的下载源 |
+| `gitea` | Gitea `xiaoshuai/licore` | 镜像站（`li63050a/licore` 会 302 重定向到它） |
+
+推送配置：`origin` 挂两个 pushurl，`git push origin main` 会**依次推 GitHub 与
+Gitea**；fetch 仍只走 GitHub。
+
+**关键差异：Gitea 上不跑 GitHub Actions。** tag 推上去只得到"源码 tag"，
+**不会**自动建 Release、更不会上传二进制资产。因此每次发版后必须手动同步一次，
+否则 Gitea 上只有源码、没有可下载的产物。
+
+同步方式（已固化为脚本）：
+
+```bash
+# 令牌：环境变量 GITEA_TOKEN，或复用 ~/.config/git/credentials
+scripts/sync-gitea-release.sh v0.9.5
+scripts/sync-gitea-release.sh v0.9.5 --dry-run   # 先看会做什么
+```
+
+脚本行为：读 GitHub Release 元数据 → 下载全部资产 → 在 Gitea 建 Release
+（已存在则复用）→ 上传资产（已存在的跳过，**支持中断后重跑**）→
+校验两侧 `SHA256SUMS` 逐字节一致 → 清理临时目录。
+
+**顺序要求**：GitHub 的 Release workflow 跑完（资产齐全）之后再跑同步脚本，
+否则会同步到一个不完整的 Release。脚本会在 GitHub 侧无资产时直接拒绝。
+
+**注意 owner 是 `xiaoshuai`**：Gitea API 与 raw 链接都要用 `xiaoshuai/licore`，
+用 `li63050a/licore` 会重定向（API 调用会因此拿到非 JSON 响应而解析失败）。
+
 ### tag 一旦推送，不要靠移动它来补充内容
 
 **Go module proxy 对已发布 tag 的缓存是不可变的**：某个版本号一经 `proxy.golang.org`
