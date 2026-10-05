@@ -137,17 +137,19 @@ func TestInputRulesDropHostIPs(t *testing.T) {
 	hostIPs := []string{"127.0.0.1", "45.207.198.91", "172.17.0.1"}
 	rules := buildInputRules("licore0", hostIPs)
 
-	if len(rules) != len(hostIPs) {
-		t.Fatalf("应有 %d 条 DROP，实际 %d: %+v", len(hostIPs), len(rules), rules)
-	}
+	var drops int
 	for _, r := range rules {
 		if r.Kind != inKindDropToHost {
-			t.Errorf("INPUT 链只应有 drop-to-host 规则，出现 %s", r.Kind)
+			continue
 		}
+		drops++
 		got := strings.Join(r.Args, " ")
 		if !strings.HasPrefix(got, "-i licore0 -d ") || !strings.HasSuffix(got, " -j DROP") {
 			t.Errorf("DROP 规则形态错误: %q", got)
 		}
+	}
+	if drops != len(hostIPs) {
+		t.Fatalf("应有 %d 条 DROP，实际 %d: %+v", len(hostIPs), drops, rules)
 	}
 }
 
@@ -168,8 +170,14 @@ func TestInputRulesSkipBridgeGateway(t *testing.T) {
 			t.Fatal("网桥网关地址被 DROP——容器访问网关会全部失败（含 DNS）")
 		}
 	}
-	if len(rules) != 1 {
-		t.Errorf("应只剩 1 条 DROP（非网关地址），实际 %d", len(rules))
+	var drops int
+	for _, r := range rules {
+		if r.Kind == inKindDropToHost {
+			drops++
+		}
+	}
+	if drops != 1 {
+		t.Errorf("应只剩 1 条 DROP（非网关地址），实际 %d", drops)
 	}
 }
 
@@ -178,23 +186,63 @@ func TestInputRulesSkipBridgeGateway(t *testing.T) {
 // 宁可不生成，也不生成"堵 0.0.0.0/0"之类的宽泛规则——那会把容器出网
 // 一并堵死。调用方（applyForwardRules）据此报错而非静默继续。
 func TestInputRulesNoHostIPsMeansNoRules(t *testing.T) {
-	if rules := buildInputRules("licore0", nil); len(rules) != 0 {
-		t.Errorf("宿主地址为空时不应生成规则，实际 %d 条", len(rules))
+	rules := buildInputRules("licore0", nil)
+	for _, r := range rules {
+		if r.Kind == inKindDropToHost {
+			t.Error("宿主地址为空时不应生成 DROP 规则")
+		}
+	}
+	// 放行规则仍应在：端口映射的回包不依赖宿主地址枚举。
+	if ruleIndex(rules, inKindEstablishedAccept) < 0 {
+		t.Error("回包放行规则不应因宿主地址枚举失败而缺失")
 	}
 }
 
-// TestInputRulesHaveNoFallbackAccept 断言 INPUT 链**没有兜底 ACCEPT**。
+// TestInputRulesEstablishedAcceptBeforeDrop 断言回包放行规则在 DROP **之前**。
 //
-// INPUT 的默认策略属于宿主（本机是 ufw 的 DROP）。LiCore 不该替宿主放行
-// 自己的入站流量——那等于把宿主的防火墙策略架空。
-func TestInputRulesHaveNoFallbackAccept(t *testing.T) {
+// 这是端口映射能工作的前提：端口映射的回包（SYN-ACK）目的地址是宿主自身
+// IP，属本地投递，走 INPUT。若 DROP 排在前面，连接永远停在 SYN_RECV
+// ——真机实测确认过这个失败形态（容器内连接状态 03，DROP 计数持续增长）。
+func TestInputRulesEstablishedAcceptBeforeDrop(t *testing.T) {
+	orig := isBridgeOwnAddr
+	t.Cleanup(func() { isBridgeOwnAddr = orig })
+	isBridgeOwnAddr = func(ip, iface string) bool { return false }
+
+	rules := buildInputRules("licore0", []string{"1.2.3.4"})
+	ai := ruleIndex(rules, inKindEstablishedAccept)
+	di := ruleIndex(rules, inKindDropToHost)
+
+	if ai < 0 {
+		t.Fatal("缺少回包放行规则——端口映射的回包会被 DROP，连接卡在 SYN_RECV")
+	}
+	if di < 0 {
+		t.Fatal("缺少 drop-to-host 规则——H2 隔离失效")
+	}
+	if ai > di {
+		t.Fatalf("回包放行(下标 %d)必须在 DROP(下标 %d) 之前，否则端口映射失效", ai, di)
+	}
+	got := strings.Join(rules[ai].Args, " ")
+	if !strings.Contains(got, "RELATED,ESTABLISHED") || !strings.Contains(got, "-i licore0") {
+		t.Errorf("回包放行规则形态错误: %q", got)
+	}
+}
+
+// TestInputRulesNoBlanketAccept 断言 INPUT 链**没有无条件的 ACCEPT**。
+//
+// 唯一的 ACCEPT 必须是 conntrack 限定的回包。无条件的 ACCEPT 会把宿主的
+// INPUT 策略架空（本机是 ufw 的 DROP），等于取消宿主防火墙。
+func TestInputRulesNoBlanketAccept(t *testing.T) {
 	orig := isBridgeOwnAddr
 	t.Cleanup(func() { isBridgeOwnAddr = orig })
 	isBridgeOwnAddr = func(ip, iface string) bool { return false }
 
 	for _, r := range buildInputRules("licore0", []string{"1.2.3.4"}) {
-		if strings.Contains(strings.Join(r.Args, " "), "ACCEPT") {
-			t.Errorf("INPUT 链不应有 ACCEPT 规则（会架空宿主策略）: %v", r.Args)
+		got := strings.Join(r.Args, " ")
+		if !strings.Contains(got, "-j ACCEPT") {
+			continue
+		}
+		if !strings.Contains(got, "RELATED,ESTABLISHED") {
+			t.Errorf("INPUT 链的 ACCEPT 必须是 conntrack 限定的回包: %q", got)
 		}
 	}
 }

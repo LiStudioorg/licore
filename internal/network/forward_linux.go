@@ -61,11 +61,16 @@ package network
 //
 // LICORE-INPUT：
 //
-//	1. -i licore0 -d <宿主IP> -j DROP                       **H2：堵容器 → 宿主**
-//	2. （无兜底 ACCEPT——INPUT 的默认策略由宿主决定，不替它放行）
+//	1. -i licore0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+//	                                                       回包放行（端口映射必需）
+//	2. -i licore0 -d <宿主IP> -j DROP                      **H2：堵容器 → 宿主**
 //
-// 第 3 条的 `RELATED,ESTABLISHED` 是**端口映射回包**的关键：宿主/外部主动
-// 连进来的连接，其方向是 `-o licore0`（流向容器），靠 conntrack 放行。
+// INPUT 的第 1 条与 FORWARD 的第 3 条**不是重复**：前者放行"容器→宿主"
+// 方向的回包（端口映射的 SYN-ACK 走这里），后者放行"外部→容器"方向的回包。
+// 两者方向相反、走的链也不同，缺任何一个都会有连接卡在 SYN_RECV。
+//
+// INPUT 链**没有兜底 ACCEPT**：INPUT 的默认策略由宿主决定（本机是 ufw 的
+// DROP），LiCore 不该替宿主放行自己的入站流量。
 
 import (
 	"fmt"
@@ -105,6 +110,7 @@ const (
 	fwdKindContainerToExternal  = "container-to-external"
 	fwdKindEstablished          = "reply-established"
 	fwdKindFallback             = "fallback-accept"
+	inKindEstablishedAccept     = "input-established-accept"
 	inKindDropToHost            = "drop-to-host"
 )
 
@@ -152,18 +158,44 @@ func buildForwardRules(bridge string, externalIfaces []string) []fwdRule {
 
 // buildInputRules 构造 LICORE-INPUT 链规则（**H2 隔离**）。
 //
-// 每个宿主地址一条 DROP。**刻意不加兜底 ACCEPT**：INPUT 的默认策略属于宿主
-// （本机是 ufw 的 DROP），LiCore 不该替宿主放行自己的入站流量——那会把宿主
-// 的防火墙策略架空。
+// ## 规则顺序（安全属性，不可调换）
 //
-// 跳过网桥自身地址：容器 DNS 指向网关（resolv.conf 里是 172.22.0.1），
-// 把网关也 DROP 掉会让 DNS **雪上加霜**（本机 DNS 本就有独立问题，
-// 见下）。同网桥互访由 FORWARD 第一条覆盖，不在这里处理。
+//  1. -i <bridge> -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+//  2. -i <bridge> -d <宿主IP> -j DROP   （每个宿主地址一条）
 //
-// hostIPs 为空时返回空列表：宁可不生成规则，也不生成"堵 0.0.0.0/0"之类的
-// 宽泛规则——那会把容器出网一并堵死。调用方据此决定告警。
+// **第 1 条必须在 DROP 之前**，它放行的是**端口映射的回包**。
+//
+// 回包为什么走 INPUT 而不是 FORWARD：端口映射的流量路径是——
+//
+//	宿主 curl <宿主IP>:18080
+//	  → OUTPUT DNAT，目的改为 172.22.0.3:80，源仍是 <宿主IP>
+//	  → SYN 到容器；nginx 回 SYN-ACK：src=172.22.0.3 dst=<宿主IP>
+//	  → 目的地址是**宿主自身 IP** ⇒ 本地投递 ⇒ **走 INPUT**
+//	  → 被 DROP 的话连接永远停在 SYN_RECV
+//
+// 真机实测确认过这个失败形态：容器内 `cat /proc/net/tcp` 显示连接状态
+// `03`（SYN_RECV），且 `-d <宿主IP> -j DROP` 的命中计数持续增长。
+//
+// 也就是说「容器→宿主」这个方向**同时包含恶意主动连接与合法回包**，
+// 二者只能靠 conntrack 区分：回包是已建立连接的一部分（ESTABLISHED）。
+// 第一版没有这条放行规则，H2 隔离生效了，但**端口映射也一起失效**。
+//
+// 跳过网桥自身地址：容器访问网关（如 172.22.0.1）是本地投递，
+// 把网关也 DROP 会让指向网关的访问全部失败。同网桥互访由 FORWARD 覆盖。
+//
+// hostIPs 为空时只保留放行规则：宁可不隔离，也不生成"堵 0.0.0.0/0"
+// 之类的宽泛规则——那会把容器出网一并堵死。调用方据此决定告警。
 func buildInputRules(bridge string, hostIPs []string) []fwdRule {
-	rules := make([]fwdRule, 0, len(hostIPs))
+	rules := make([]fwdRule, 0, len(hostIPs)+1)
+
+	// 1. 回包放行。**必须在 DROP 之前**，否则端口映射失效。
+	rules = append(rules, fwdRule{
+		Kind: inKindEstablishedAccept,
+		Args: []string{"-i", bridge, "-m", "conntrack",
+			"--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"},
+	})
+
+	// 2. H2 隔离：容器主动发起、目的为宿主本机地址的新连接一律 DROP。
 	for _, ip := range hostIPs {
 		if ip == "" || isBridgeOwnAddr(ip, bridge) {
 			continue
