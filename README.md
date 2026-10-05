@@ -1,5 +1,8 @@
 # LiCore
 
+官网 / 在线文档：**<https://licore.z321.cc.cd>** —— 版本列表、更新日志与下载链接
+实时同步自本仓库的 Release。
+
 > ⚠️ **安全提示**：**v0.8.0 之前的版本，容器没有 capability 隔离**——在 root 下
 > 运行时容器内进程即宿主 root 且持有**全部** capability，既没有 cap-drop 也没有
 > seccomp：容器内 `echo b > /proc/sysrq-trigger` 可以直接重启宿主、可加载 eBPF、
@@ -680,3 +683,7 @@ LiCore 是个人项目，无商业支持。如果它帮到了你，可以请我�
 ## 开源协议
 
 AGPL-3.0-only，详见 [LICENSE](LICENSE)。
+
+---
+
+官网：<https://licore.z321.cc.cd>（版本、更新日志与下载链接实时同步自本仓库）
