@@ -144,12 +144,32 @@ func nnpValue(t *testing.T, out string) string {
 	return ""
 }
 
-// TestNoNewPrivsIsClearByDefault 是**对照组**：不调用 setNoNewPrivs 时
+// requireNoNewPrivsBaseline 探测"什么都没做"时 helper 读到的 NoNewPrivs。
+//
+// no_new_privs 是**单向、不可清除**的线程标志。如果测试进程被继承的环境里
+// 它已经是 1（沙箱/CI 的包装进程常见，例如带 no_new_privs 启动的安全沙箱——
+// 该标志同时会禁用 sudo），那么"我们设上之后它才为 1"这一断言就完全没有
+// 判别力：什么都不做它也是 1。
+//
+// 此时必须**显式 skip**，不能让断言在盲环境里静默通过——与 capability 测试
+// 在缺少 CAP_SETPCAP 时显式 skip 是同一原则（见 capability_linux_test.go）。
+func requireNoNewPrivsBaseline(t *testing.T) {
+	t.Helper()
+	out := runNNPHelper(t, "get")
+	if got := nnpValue(t, out); got != "0" {
+		t.Skipf("环境已预置 NoNewPrivs=%s（该标志不可清除，由测试进程继承而来），"+
+			"本环境下的设置/继承断言没有判别力；请在真机或标准 CI 上验证", got)
+	}
+}
+
+// TestNoNewPrivsIsClearByDefault 是对照组：不调用 setNoNewPrivs 时
 // 该标志必须为 0。
 //
 // 没有这条断言，"设为 1"的测试就无法排除"内核/环境本来就让它为 1"的可能，
 // 也就证明不了真的是我们设置的。
 func TestNoNewPrivsIsClearByDefault(t *testing.T) {
+	// 环境本身已是 1 时本用例提供不了任何证据，显式 skip。
+	requireNoNewPrivsBaseline(t)
 	out := runNNPHelper(t, "get")
 	if got := nnpValue(t, out); got != "0" {
 		t.Fatalf("对照组 NoNewPrivs = %s，期望 0（该标志默认必须为关）", got)
@@ -157,7 +177,11 @@ func TestNoNewPrivsIsClearByDefault(t *testing.T) {
 }
 
 // TestSetNoNewPrivs 验证 setNoNewPrivs 真的把标志置上了。
+//
+// 需要基线守卫：环境预置为 1 时，即使 setNoNewPrivs 完全没生效，
+// 下面的 "1" 断言也会通过——那是假阳性。
 func TestSetNoNewPrivs(t *testing.T) {
+	requireNoNewPrivsBaseline(t)
 	out := runNNPHelper(t, "set")
 	if strings.Contains(out, "SET_FAILED") {
 		// 极旧内核（< 3.5）不支持该 prctl；这不是代码缺陷，明确跳过。
@@ -175,7 +199,10 @@ func TestSetNoNewPrivs(t *testing.T) {
 //
 // 这是它对本项目**唯一有意义**的性质：我们的用法是"在 execve 用户命令之前
 // 设上"，若不能跨 exec 继承，那容器里的用户命令就完全不受保护。
+//
+// 同样需要基线守卫：环境预置为 1 时"继承后仍为 1"证明不了任何东西。
 func TestNoNewPrivsSurvivesExecve(t *testing.T) {
+	requireNoNewPrivsBaseline(t)
 	out := runNNPHelper(t, "set-exec")
 	if got := nnpValue(t, out); got != "1" {
 		t.Fatalf("execve 之后 NoNewPrivs = %s，期望 1（该标志必须跨 exec 继承）\n输出:\n%s", got, out)
