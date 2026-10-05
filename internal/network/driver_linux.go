@@ -106,18 +106,71 @@ func nftCreateTables() error {
 	return nil
 }
 
-// runNft 运行 nft 子进程并贴上下文；容忍幂等类错误（表/链已存在、要删的
-// 规则不存在）。
+// nftIdempotentMarkers 是"重复操作"类错误的识别串。
+//
+// **不要往里加 "No such file or directory"**：nft 在**缺少内核特性**时
+// 也用这句话报错，最典型的是本机实测到的
+//
+//	# nft add rule ip test post masquerade
+//	Error: Could not process rule: No such file or directory
+//	                                            ^^^^^^^^^^
+//
+// 把它当幂等错误吞掉，会让 NAT 规则**静默不生效**：容器照常启动、
+// 用户却连不上网。真正的"表/链已存在"报的是 "File exists"。
+var nftIdempotentMarkers = []string{
+	"File exists",
+	"already exists",
+}
+
+// runNft 运行 nft 子进程并贴上下文；只容忍**幂等类**错误（表/链已存在）。
+//
+// 失败时返回包装了 ErrNATApply 的错误，且带上：完整命令、nft 原始 stderr、
+// 以及可能原因提示。错误必须能被调用方冒泡到 `licore run`——静默降级会让
+// 用户拿到一个"起来了但连不上网"的容器，比启动失败难排查得多。
 func runNft(args ...string) error {
 	cmd := exec.Command("nft", args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		msg := string(out)
-		if containsAny(msg, "File exists", "exists", "No such file or directory", "does not exist", "not found") {
-			return nil
-		}
-		return fmt.Errorf("nft %s 失败: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(msg))
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
 	}
-	return nil
+	msg := strings.TrimSpace(string(out))
+	if containsAny(msg, nftIdempotentMarkers...) {
+		return nil
+	}
+	// 权限不足单独归类：非 root 时容器本来就起不来（网桥都建不了），
+	// 调用方据此保持"降级告警"行为，而不是把整个 run 判死。
+	// 其余失败（如本机 nft 不支持 masquerade）才是真正的配置错误，
+	// 必须让 run 失败——容器起来了却连不上网是最难排查的状态。
+	if isPermissionDenied(msg) {
+		return fmt.Errorf("%w: nft %s: %v (%s)",
+			ErrNotRoot, strings.Join(args, " "), err, msg)
+	}
+	return fmt.Errorf("%w: nft %s: %v (%s)%s",
+		ErrNATApply, strings.Join(args, " "), err, msg, nftFailureHint(msg))
+}
+
+// isPermissionDenied 判断 nft 的失败是否属于"权限不足"。
+//
+// nft 在非 root 下报 "Operation not permitted (you must be root)"，
+// 在缺 CAP_NET_ADMIN 时可能只给 EPERM 字样；两者都要认。
+func isPermissionDenied(stderr string) bool {
+	return containsAny(stderr, "Operation not permitted", "you must be root", "Permission denied")
+}
+
+// nftFailureHint 针对已知的 nft 失败给出可执行提示。
+//
+// 目前只覆盖一条真机实测遇到的：Ubuntu 22.04 标准版 nftables 1.0.2 上
+// `masquerade` 语句不可用（同一个 nft 的 `dnat` 却正常）。这不是版本太老，
+// 而是该语句依赖的内核 NAT 注册路径在这台机器上不通；iptables 的
+// `-j MASQUERADE`（xt_MASQUERADE 路径）在同一台机器上可用——因此提示里
+// 直接给出可用的替代命令。
+func nftFailureHint(stderr string) string {
+	if !strings.Contains(stderr, "No such file or directory") {
+		return ""
+	}
+	return "；若失败的是 masquerade，说明本机 nft 不支持该语句" +
+		"（可用 `nft add rule ... masquerade` 复现），" +
+		"iptables 的 MASQUERADE 通常仍可用"
 }
 
 func containsAny(s string, subs ...string) bool {

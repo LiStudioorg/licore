@@ -28,4 +28,11 @@ var (
 	ErrBadPortMapping = errors.New("licore/network: 端口映射参数非法")
 	// ErrNoFirewall 表示既没有可用的 nft，也没有可用的 iptables。
 	ErrNoFirewall = errors.New("licore/network: 未找到可用的 nft / iptables")
+	// ErrNATApply 表示防火墙工具存在、但规则写入失败（如本机 nft 不支持
+	// masquerade 语句，见 driver_linux.go 的说明）。
+	//
+	// 与 ErrNoFirewall 的分工：后者是"连工具都没有"，本错误是"工具有、
+	// 但命令失败"。两者都**必须**让 `licore run` 失败——容器起来了却连不上网，
+	// 对用户是比启动失败更难排查的意外行为。
+	ErrNATApply = errors.New("licore/network: 防火墙规则应用失败")
 )

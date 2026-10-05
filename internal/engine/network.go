@@ -4,6 +4,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -127,14 +128,35 @@ func wireNetworkBeforeStart(st *store.Store, cfg *store.ContainerConfig, netName
 		return fmt.Errorf("接入网络 %s: %w", netName, err)
 	}
 	rollback := func() { _ = m.Disconnect(netName, cfg.ID) }
-	// 登记端口映射并实化 NAT（绑定到容器 IP）。
+	// 登记端口映射（仅 -p 时才有）与实化 NAT。
+	//
+	// **ApplyNAT 必须无条件调用，不能只在 len(ports) > 0 时调**：
+	// applyPortRules 除了 DNAT（端口映射）还负责**出口 MASQUERADE**，
+	// 而出口 NAT 是所有 bridge 容器都需要的——不带 -p 的容器同样要能访问外网
+	// （与 Docker 语义一致）。原先写在 if len(ports) > 0 里面，导致不带 -p 的
+	// 容器根本没有 masquerade 规则、**完全无法出网**（真机实测确认）。
+	//
+	// **失败必须回滚并冒泡**，不能 slog.Warn 后继续：NAT 写不进去意味着
+	// 容器连不上外网（带 -p 时还包括端口映射不生效）。让容器"起来了但没网"
+	// 是比启动失败更难排查的意外行为——用户会去查容器内部，而问题在网络层。
+	// 宁可起不来，也不要静默降级（AGENTS.md：禁止参数接受但运行时假装生效）。
 	if len(ports) > 0 {
 		if err := m.AllocatePorts(netName, cfg.ID, ports); err != nil {
 			rollback()
 			return err
 		}
-		if err := m.ApplyNAT(netName); err != nil {
-			slog.Warn("实化网络 NAT 失败（可能需要 root 或 nft）", "net", netName, "err", err)
+	}
+	if err := m.ApplyNAT(netName); err != nil {
+		// 权限不足：非 root 时容器本来就起不来（网桥 / veth 同样建不了），
+		// 保持降级告警即可——这里再报错只会掩盖更根本的权限问题。
+		if errors.Is(err, network.ErrNotRoot) {
+			slog.Warn("网络 NAT 未应用（权限不足，容器可能无外网）",
+				"net", netName, "err", err)
+		} else {
+			// 其余失败是真正的配置错误（如本机 nft 不支持 masquerade）：
+			// 必须回滚并冒泡。让容器"起来了但连不上网"比启动失败难排查得多。
+			rollback()
+			return fmt.Errorf("容器网络 NAT 配置失败（已回滚，容器未创建）: %w", err)
 		}
 	}
 	cfg.Network = netName
