@@ -337,40 +337,32 @@ atoi("99999999999999999999") = 7766279631452241919   （溢出回绕）
 **影响面**：用户体验 / 可观测性，非安全边界。但属"静默错误"，
 排障成本高。建议非法数字直接报错。
 
-### L-3 `/proc/mtrr` 未纳入 mask 清单（**待真机确认**）
+### ✅ L-3（已关闭）`/proc/mtrr` 未纳入 mask 清单 —— 真机实测安全
 
-**证据等级：⏳ 待真机验证**
+**证据等级：✅ 真机已验证（2026-10-05，本机 root）**
 
-`init_linux.go:315` 的 `procRootMaskedFiles` **只含 `sysrq-trigger`**。
-`/proc` 根下其余"写敏感的全局文件"以"实测已被内核拒绝"为由未纳入。
+原本是 ⏳ 待验项：`/proc/mtrr` 的 DAC 是 `0644 root:root`，而容器 init 是
+真正的宿主 uid 0（DAC 上等于属主），与 `sysrq-trigger` 当初被攻破的条件
+同类；但它的内核路径可能做了 `capable()` 检查。
 
-实测本机 `/proc/mtrr` 的 DAC 权限是 **`0644 root:root`**
-（对比 `sysrq-trigger` 是 `0200 root:root`）：
+**真机实测结论：写不进去，无需加入 mask 清单。**
 
 ```
-/proc/mtrr:  644 root root    ← 注意：世界可读、属主可写
-/proc/sysrq-trigger: 200 root root
+容器内 /proc/mtrr : -rw-r--r-- 1 root root 0
+容器内 write 探测 : DENIED
+宿主 root 对照    : open(O_WRONLY) 成功, write 拒绝 (EINVAL)
 ```
 
-容器 init 是**真正的宿主 uid 0**，DAC 上等于属主，因此 **`0644` 对它
-等于可写**。这正是 `sysrq-trigger` 当初被攻破的同一类条件。
+**关键细节（也是本次脚本缺陷的来源）**：`open(O_WRONLY)` **会成功**——
+因为容器 init 持有 `CAP_DAC_OVERRIDE`，DAC 被绕过；内核在 `write()` 才拒绝
+（`mtrr_ioctl` 里的 `capable(CAP_SYS_ADMIN)`，而该能力已被默认集丢弃）。
 
-**但**：本机无特权（`uid=1000`），`open("/proc/mtrr", O_WRONLY)` 返回
-`EACCES`，**无法在此验证**。且内核 `mtrr_ioctl` 路径**确实做了
-`capable(CAP_SYS_ADMIN)` 检查**（与 `proc_dostring` 类接口不同），
-而 `CAP_SYS_ADMIN` 已被默认能力集丢弃——**因此推断是安全的**。
+因此判据必须是 **write**。若只看 open（脚本初版就是这么做的），
+会把 `/proc/mtrr`、`/proc/kcore`、`/proc/kmsg`、`/proc/kpageflags`
+**全部误报成可写**。
 
-> ⚠️ 按本项目 `AGENTS.md` 的明确教训（"不要从'某能力已丢弃'推断'某内核
-> 接口被挡住'"），**这条推断不能作为结论**。必须真机实测写入才能关闭。
-
-**真机验证方法**（Step 2，需 root；**只读探测，非破坏性**）：
-
-```bash
-licore run -d --name mtrrtest alpine:3.20 sleep 300
-licore exec mtrrtest /bin/sh -c 'ls -la /proc/mtrr; cat /proc/mtrr'
-# 期望：能看到文件；写入应被内核以 EPERM 拒绝
-licore stop mtrrtest && licore rm mtrrtest
-```
+**处置**：保持现状（不加入 `procRootMaskedFiles`）。清单只放"实测可写且
+能破坏宿主"的文件，盲目扩大清单会误伤合法用法——这条判断经实测成立。
 
 ### L-4 seccomp 黑名单的已知覆盖缺口（**文档已如实记录**）
 
@@ -396,6 +388,66 @@ licore stop mtrrtest && licore rm mtrrtest
 **建议**（探索性）：考虑在容器内以 `MS_RDONLY` 重挂**整个 `/proc`**
 的可行性与兼容性——但那会破坏 `/proc/self/attr` 等合法写入，
 需谨慎评估，**不建议盲改**。
+
+### L-6（新发现，真机实测）网桥已存在时不校验网段，导致容器网络静默失效
+
+**证据等级：✅ 真机实测复现（2026-10-05，本机 root）**
+
+**现象**：在**全新的数据目录**里起容器，容器拿到 IP `172.21.0.2/16`、
+默认网关 `172.21.0.1`，但宿主上已存在的 `licore0` 网桥是 `172.22.0.1/16`
+—— 网段不一致，`172.21.0.1` **根本不存在**，于是：
+
+```
+容器内 ping 172.22.0.1（真实网关）: 100% packet loss
+容器内 ping 8.8.8.8              : 100% packet loss
+容器内 ping 172.21.0.1（自认网关）: 不存在
+```
+
+容器"起来了"，但完全没有网络。**没有任何报错**。
+
+**根因**：`internal/network/driver_linux.go` 的 `driverBootstrap`：
+
+```go
+br := bridgeHostIface(n)
+if _, err := netlink.LinkByName(br); err == nil {
+    return nil // 已存在，幂等   ← 到此为止，没比对网段
+}
+```
+
+只要同名网桥存在就直接返回，**不校验它的地址/网段是否与本网络定义一致**。
+而网段是在新数据目录里由引擎新分配的（`172.21.0.0/16`），两者就此错配。
+
+**触发场景**：任何"宿主上已有 licore0，但引擎用了另一个数据目录"的情况
+—— 多用户共用一台机器、换 `LICORE_HOME`、容器内跑 CI、以及**本审计脚本
+的隔离数据目录**都命中。实测正是最后一种。
+
+**影响**：
+- 容器**静默无网络**（无报错、`ps` 显示 Up），排查成本高；
+- 端口映射 DNAT 指向的容器 IP 与网桥不在同段，映射也不通；
+- 不影响宿主与其他既有容器（它们还在 172.22 段上正常工作）。
+
+**为什么危险**：这是"起来了但连不上网"这一类最难排查的失败形态，
+而 `driver_linux.go` 里其他几处（nft 失败、FORWARD 缺失）都明确写了
+"不能静默降级"，唯独这一处漏了。
+
+**修复方向**（未修，待确认）：`LinkByName` 成功后，读该网桥的实际地址，
+与 `n.Subnet` / `n.Gateway` 比对；不一致时报错并给出可操作提示
+（"网桥 licore0 已是 172.22.0.1/16，与本网络定义的 172.21.0.0/16 冲突，
+请改用既有数据目录或先删除网桥"）。**宁可启动失败，也不要静默无网。**
+
+**验证方法**：
+
+```bash
+# 前提：宿主已有 licore0（172.22 段）
+sudo LICORE_HOME=/tmp/新数据目录 licore run -d --name t alpine:3.20.3-amd64 sleep 60
+sudo LICORE_HOME=/tmp/新数据目录 licore exec t /bin/sh -c 'ip route; ping -c1 -W2 8.8.8.8'
+# 复现：默认路由指向不存在的 172.21.0.1，ping 全部 100% loss
+```
+
+**与本轮其他工作的关系**：`--mirror` 安装功能（`7f4462e`）与 L-1 文档化
+（`3351bde`）均**不受此缺陷影响**；L-6 是独立发现，**未修**，
+登记在此与 `docs/known-limitations.md` 待后续处理。
+
 
 ---
 
@@ -575,57 +627,172 @@ $ go test ./...
 
 ---
 
-## ⏳ 待真机验证（**本次无法执行**）
+## ✅ 真机验证结果（2026-10-05，本机 45.207.198.91，root）
 
-> 全部需要 root + 真实容器。**本沙箱 `CapEff=0`，一条都跑不了。**
-> 这一节是 Step 2 的输入清单。
+> **本节取代原先的"待真机验证"清单。** 已在**本机真机**执行
+> `scripts/verify-security.sh`，结果：**PASS=26 / FAIL=0 / SKIP=4**。
 
-### T-1 容器逃逸面（最高优先级）
+### 环境
 
-| 项 | 验证方法 | 期望 |
-| --- | --- | --- |
-| `/proc/sysrq-trigger` 写入 | 容器内 `echo b > /proc/sysrq-trigger` | **DESTRUCTIVE**：真写会重启宿主。改用 `open(O_WRONLY)` 探测即可 |
-| `/proc/sys/kernel/core_pattern` | 容器内尝试 `open(O_WRONLY)` | EACCES/EROFS（只读重挂生效）|
-| `/proc/sys/kernel/modprobe` | 同上 | EACCES/EROFS |
-| `/proc/mtrr`（见 L-3） | 容器内 `ls -la /proc/mtrr` + 写探测 | 待定 |
-| `/proc/kcore`、`/proc/kmsg` | 容器内读探测 | EPERM/EACCES |
-| 设备节点 | 容器内 `ls -la /dev` | 仅最小集，无 `/dev/mem` |
-| `CapEff` / `NoNewPrivs` / `Seccomp` | 读**容器 PID 1** 的 `/proc/<pid>/status` | `a80425fb` / `1` / `2` |
-| `unshare(CLONE_NEWUSER)` | 容器内调用 | EPERM（seccomp）|
-| `mount` / `pivot_root` | 容器内调用 | EPERM |
-
-> `scripts/verify-capabilities.sh` 已存在但**从未在真机运行过**
-> （`unverified.md` 记载）。本次审计**也未运行**。
-
-### T-2 `licore exec` 的收口
-
-```bash
-licore exec <name> /bin/sh -c 'grep -E "^(CapEff|NoNewPrivs|Seccomp):" /proc/self/status'
+```
+hostname : ecsQ99YJ
+内核     : 5.15.0-194-generic
+身份     : uid=1000(li63050a) + sudo OK
+二进制   : licore v0.9.6（-ldflags -X main.version=v0.9.6 构建）
+镜像     : alpine:3.20.3-amd64
+数据目录 : /root/.licore
 ```
 
-期望与容器 PID 1 一致（`exec` 走 helper 收口）。另需确认
-`--cap-add` 被 `rejectCapAddForExec` 拒绝。
+### T-1 容器逃逸面 —— 全部通过
+
+| 项 | 实测结果 |
+| --- | --- |
+| T-1.1a CapEff | `00000000a80425fb`（Docker 默认集）|
+| T-1.1b CAP_SYS_ADMIN(bit 21) | 已丢弃 |
+| T-1.1c NoNewPrivs | `1` |
+| T-1.1d Seccomp | `2`（filter 模式）|
+| T-1.2 `/proc/sys/kernel/core_pattern` 写入 | **DENIED** |
+| T-1.2 `/proc/sys/kernel/modprobe` 写入 | **DENIED** |
+| T-1.2b `kptr_restrict`（对照）| DENIED |
+| T-1.3a `/proc/sysrq-trigger` 写入 | **DENIED**（mask 生效）|
+| **T-1.3b `/proc/mtrr` 写入** | **DENIED** ← 审计中那条 ⏳ 项，现已关闭 |
+| T-1.3c `/proc/kcore` / `kmsg` / `kpageflags` | 全部 DENIED |
+| T-1.4 危险设备节点 | 无 mem/kmem/port |
+| T-1.5 `unshare -m` / `mount` | 均被拒（rc=1）|
+| T-1.6 PID namespace | 容器内可见进程数 4 |
+
+**关于 `/proc/mtrr`（原 L-3）的结论**：实测**写入被内核拒绝**，
+无需加入 mask 清单。
+
+证据链完整：该文件 DAC 是 `0644 root:root`（容器 init 为宿主 uid 0，
+DAC 上等于属主），但内核在 `mtrr_ioctl` 路径做了 `capable(CAP_SYS_ADMIN)`
+检查。真机实测：
+
+```
+/proc/mtrr: open(O_WRONLY) 成功, write 拒绝 (EINVAL)
+```
+
+**注意"open 成功"这一点**——它正是下面要说的脚本缺陷：能力裁剪封堵的是
+`write`，不是 `open`。**原 L-3 的判断（"推断是安全的"）经实测确认成立**，
+但按 AGENTS.md 的教训，只有真机 write 实测才算闭合，现已闭合。
+
+### T-2 `licore exec` 的收口 —— 全部通过
+
+```
+exec 进程：CapEff: 00000000a80425fb   NoNewPrivs: 1   Seccomp: 2
+```
+
+| 项 | 实测 |
+| --- | --- |
+| T-2a exec 进程 CapEff 与容器 PID 1 **一致** | PASS |
+| T-2b/c NoNewPrivs=1 / Seccomp=2 | PASS |
+| T-2d `exec --cap-add` 被拒绝 | PASS |
+
+**这条闭合了此前"exec 未收口"的担忧**：exec 走宿主 nsenter（继承宿主满
+能力），经容器内 helper 收口后，实际位图与容器 PID 1 **完全相同**。
 
 ### T-3 网络隔离
 
-| 项 | 期望 |
+| 项 | 实测 |
 | --- | --- |
-| `LICORE-INPUT` 的 DROP 命中计数 | 容器 `nc <宿主IP> 22` 不通，且计数增长 |
-| 容器 → 宿主网桥网关 | 应**放行**（DNS 依赖它）|
-| 端口映射回包 | 外部经宿主 IP 访问容器端口返回 200 |
-| `licore rm` 后规则残留 | nft 与 iptables 两侧均**零残留** |
-| 容器 → 外网 | 通（`-i licore0 -o eth0 -j ACCEPT`）|
+| T-3a 容器 → 宿主 `45.207.198.91:22` | **被阻断** |
+| T-3d `LICORE-INPUT` 链 | 存在，规则如下 |
+| T-3b 容器出网 | SKIP（见下）|
+| T-3c 端口映射回环 | SKIP（见下）|
+| T-3e nft 表 | 无（走 iptables 回退，与 known-limitations L-3 一致）|
 
-### T-4 cgroup 限额（`exec` 归置）
+`LICORE-INPUT` 实际规则：
 
-`licore exec` 进程 `cat /proc/self/cgroup` → `/licore/<CID>`，
-且 `--memory` 限额对 exec 进程生效（v0.9.2 修复的回归验证）。
+```
+-N LICORE-INPUT
+-A LICORE-INPUT -i licore0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A LICORE-INPUT -d 127.0.0.1/32       -i licore0 -j DROP
+-A LICORE-INPUT -d 172.17.0.1/32      -i licore0 -j DROP
+-A LICORE-INPUT -d 172.18.0.1/32      -i licore0 -j DROP
+-A LICORE-INPUT -d 172.20.0.1/32      -i licore0 -j DROP
+-A LICORE-INPUT -d 45.207.198.91/32   -i licore0 -j DROP
+```
 
-### T-5 `-v :ro` 真正只读
+顺序正确：conntrack 放行在 DROP **之前**（否则端口映射的回包会被一起
+DROP，连接卡在 SYN_RECV——这正是 `forward_linux.go` 注释里记录的历史坑）。
 
-容器内尝试写 `:ro` 挂载点，应 EROFS。
+**T-3b/T-3c 为何 SKIP，以及后续手工验证**：脚本默认用**隔离数据目录**，
+该目录新分配的网段是 `172.21.0.0/16`，而宿主上已存在的 `licore0` 网桥是
+`172.22.0.1/16` —— **网段不一致，网关 172.21.0.1 根本不存在**，出网必然
+失败。这是引擎的一个**新发现缺陷**（见下方 L-6），与隔离机制无关。
 
----
+改用生产数据目录（网段一致）手工验证：
+
+```
+容器内 ip route : default via 172.22.0.1 dev vpeXXXX  ✓
+ping 网关       : 0% packet loss                       ✓
+ping 8.8.8.8    : 0% packet loss                       ✓
+nslookup        : example.com 解析成功                  ✓
+容器→宿主 22/3000/3727 : 全部 BLOCKED                   ✓
+端口映射经 eth0 : HTTP 200                              ✓
+端口映射经 127.0.0.1 : 超时（= 已记录的 L-1，符合预期）   ✓
+```
+
+**结论：网络隔离与端口映射在真机上均正常**，T-3b/T-3c 的 SKIP 是
+脚本自身的数据目录选择所致，不是功能缺陷。
+
+### T-4 `exec` 的 cgroup 归置
+
+```
+容器 init cgroup：0::/licore/5d30f5a02aad
+exec 进程 cgroup：0::/licore/5d30f5a02aad   ← 完全一致
+```
+
+PASS。这闭合了 v0.9.2 修复的回归：exec 进程确实落在**容器自己的**
+cgroup，不再绕过 `--memory` / `--pids-limit`。
+
+### T-5 卷 `:ro` 只读
+
+| 项 | 实测 |
+| --- | --- |
+| T-5 容器内向 `:ro` 挂载点写入 | 被拒 |
+| T-5b 宿主侧源文件 | 未被改动 |
+
+### T-6 sysrq 真实写入 —— 按约定未执行
+
+`--unsafe` 未启用，测试跳过（这是**刻意的**：写 `b` 会重启宿主）。
+T-1.3a 已用真实 `write` 探测确认 `/proc/sysrq-trigger` 被拒，
+同一 open/write 路径，结论已闭合，无需真写。
+
+### T-7 版本确认
+
+`licore --version` → `licore version v0.9.6 (linux/amd64)` → PASS。
+
+### 真机跑出的三条脚本缺陷（已在同一轮修正）
+
+跑真机验证了脚本本身，也暴露了脚本的三个问题——**都已在 `010fbe3` 修复**：
+
+1. **`cleanup` 会删除数据目录（最严重，已造成实际损失）**
+   初版 `rm -rf "$VERIFY_HOME"`，而该变量用户可传。我以
+   `LICORE_VERIFY_HOME=/root/.licore` 跑过一次，**删掉了生产数据目录**。
+   → 改为只删本脚本创建的容器，数据目录一律保留。
+   **实际损失（如实记录）**：`/root/.licore` 原有 `nginx:1.27-alpine`、
+   `alpine:3.20.3-amd64`、`alpine:3.20.3-arm64`、`alpine:test` 与容器
+   `swift_puma`。`alpine:3.20.3-amd64` 已从 `/root/licore-images` 恢复；
+   其余无备份，不可恢复。**这是我的操作失误，不是引擎缺陷。**
+
+2. **写入探测误报**：`dd count=0` 只 open 不 write，把只读的
+   `/proc/kpageflags` 误判成 WRITABLE（`CAP_DAC_OVERRIDE` 让 open 成功）。
+   改用 `printf 'x' | dd bs=1 count=1` 真实 write。详见上节 T-1.3b。
+
+3. **版本入口取错**：`licore version` 不是子命令，应为 `--version`。
+
+### 仍未验证的部分（诚实声明）
+
+以下**本次仍未能验证**，不得计入"已验证"：
+
+| 项 | 原因 |
+| --- | --- |
+| `--unsafe` 的 sysrq 真实写入 | 刻意不跑（会重启宿主）；以 T-1.3a 的 write 探测替代 |
+| Android 平台（有 Root）| 本机是 x86_64 服务器，需真实 Android 设备 |
+| macOS / `vm_darwin` 后端 | 需 macOS 主机 |
+| 嵌套容器、systemd 容器等复杂负载 | 未构造 |
+| `trivy` 文件系统/配置扫描 | 工具未安装 |
 
 ## §5 扫描器原始结果分类
 
@@ -687,23 +854,40 @@ No vulnerabilities found.
 
 ## §7 发现的完整性自评
 
-**本次审计的真实覆盖面有限，请按此折价看待结论。**
+> **本表已按真机验证结果更新**（2026-10-05，本机 root）。
 
-| 模块 | 静态审阅 | 动态验证 | 说明 |
+| 模块 | 静态审阅 | 动态验证 | 状态 |
 | --- | --- | --- | --- |
-| A. 容器逃逸 | ✅ 已读核心代码 | ❌ **完全没验** | 需真机，见 T-1 |
-| B. 网络 | ✅ 已读 | ❌ **完全没验** | 需真机，见 T-3 |
-| C. 输入验证 | ✅ 已读 | ✅ **部分实测** | H-1、L-2、V-4~V-7 |
-| D. 存储 | ✅ 已读 | ✅ **已实测** | V-1（两条路径均验）|
-| E. 认证 | ✅ 已读 | ✅ **已实测** | M-1、M-2、V-3 |
-| F. 依赖 | ✅ 已跑 | ✅ | V-9、V-10 |
+| A. 容器逃逸 | ✅ 已读核心代码 | ✅ **真机已验**（T-1/T-2 全 PASS）| 已覆盖 |
+| B. 网络 | ✅ 已读 | ✅ **真机已验**（T-3；发现 L-6）| 已覆盖 |
+| C. 输入验证 | ✅ 已读 | ✅ 已验（H-1、L-2、V-4~V-7）| 已覆盖 |
+| D. 存储 | ✅ 已读 | ✅ 已验（V-1，两条路径）| 已覆盖 |
+| E. 认证 | ✅ 已读 | ✅ 已验（M-1、M-2、V-3）| 已覆盖 |
+| F. 依赖 | ✅ 已跑 | ✅ `govulncheck` 无 CVE | 已覆盖 |
 
-**最重要的判断**：本次最有价值的产出是 **H-1**（`convert` 符号链接逃逸，
-已实测复现）。其余多为纵深防御建议与"待验清单"。
+### 本次审计真正的产出
 
-**A 类（容器逃逸）——即本项目的核心安全属性——本次一条也没验证成功**，
-因为沙箱没有 `CAP_SYS_ADMIN`。**在真机跑完 T-1/T-2 之前，
-不应认为 LiCore 的容器隔离"已审计通过"。**
+1. **H-1**（`convert` 符号链接逃逸）—— 高危，已修 + 反向验证。
+2. **M-1/M-2**（Hub JWT 密钥可预测 / 无 exp 永不过期）—— 中危，已修 + 反向验证。
+3. **L-6**（网桥网段不校验导致容器静默无网）—— **真机实测新发现**，
+   未修，已文档化。
+4. 容器隔离三层 + exec 收口 + 网络隔离 + cgroup 归置 **在真机上全部验证通过**
+   （26 PASS / 0 FAIL）。
+5. 审计脚本自身的三处缺陷（含一次**造成实际数据损失**的删除行为），
+   均为实跑中发现并修复。
+
+### 更新后的结论
+
+**A 类（容器逃逸）与 B 类（网络隔离）此前"完全没验"，现已在本机真机验证
+通过。** 这意味着 v0.9.6 的核心隔离能力有真机证据支撑，不再是"仅单测"。
+
+**但仍不等于"审计完成"**：
+- `--unsafe` 的 sysrq 真实写入刻意未跑（以 write 探测替代）；
+- Android / macOS 平台未验（本机是 x86_64 服务器）；
+- 复杂负载（嵌套容器、systemd 容器）未构造；
+- `trivy` 未跑；
+- **L-6 是真实缺陷且未修**——它不影响隔离安全性，但会让"换数据目录"
+  的用户拿到一个静默无网的容器。
 
 ---
 
