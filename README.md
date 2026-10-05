@@ -85,14 +85,32 @@ curl -fsSL https://raw.githubusercontent.com/LiStudioorg/licore/main/scripts/ins
 curl -fsSL https://raw.githubusercontent.com/LiStudioorg/licore/main/scripts/install.sh | bash -s -- --dry-run
 ```
 
-常用选项：
+### 方式二：国内网络 / GitHub 受限时走 Gitea 镜像
+
+GitHub 访问受限时，有两个**互相独立**的下载环节都要绕开：脚本本体、
+以及脚本再去下载的 Release 资产。用加速前缀包住 raw 链接解决前者，
+用 `--mirror` 让后者也走镜像站：
+
+```bash
+curl -fsSL https://gh-proxy.org/https://raw.githubusercontent.com/LiStudioorg/licore/main/scripts/install.sh \
+  | sudo bash -s -- --mirror https://gitea.com/xiaoshuai/licore
+```
+
+`--mirror` 收的是**镜像站仓库根地址**，脚本自行拼接
+`releases/download/<tag>/...` 与 API 路径；也可以只给 host
+（`--mirror https://gitea.com`），脚本会补默认的 `xiaoshuai/licore`。
 
 | 选项 | 说明 |
 | --- | --- |
 | `--version <TAG>` | 指定版本，如 `--version v0.7.0`（默认取最新 Release） |
 | `--prefix <DIR>` | 安装目录（默认 `/usr/local/bin`） |
+| `--mirror <URL>` | 改用镜像站下载（默认 GitHub）；如 `https://gitea.com/xiaoshuai/licore` |
 | `--dry-run` | 只显示将执行的操作 |
 | `--force` | 目标已存在时覆盖（默认拒绝覆盖） |
+
+> **镜像站的信任面**：用 `--mirror` 时，你信任该镜像站未篡改资产——这与
+> "信任 GitHub 未篡改"性质相同，但镜像站是第三方。SHA256SUMS 与归档仍来自
+> 同一来源，因此同样**只能发现传输损坏，不能防篡改**。
 
 脚本行为约定：平台不支持、校验失败、目标已存在等情况一律**明确报错并停止**，不静默降级；
 不会改写你的 `.bashrc` / `.zshrc`，若安装目录不在 `PATH` 中只提示一句。
