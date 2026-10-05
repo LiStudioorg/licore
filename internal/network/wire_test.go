@@ -22,8 +22,17 @@ func TestWriteDNSFilesToCreatesEtc(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(rc) != "nameserver 172.18.0.1\n" {
-		t.Fatalf("resolv.conf= %q", rc)
+	// 本测试的意图是「/etc 被自动创建、文件写成功」，与具体 DNS 地址无关。
+	// resolv.conf 的内容现在来自宿主探测（见 dnsresolve_linux.go），
+	// 因此这里只断言"写出了可用的 nameserver 行"，不硬编码地址——
+	// 硬编码会在换机器（上游不同）时误报失败。
+	rs := string(rc)
+	if !strings.Contains(rs, "nameserver ") {
+		t.Fatalf("resolv.conf 应含 nameserver 行，实际 %q", rs)
+	}
+	// **且不应再指向网桥网关**：网关上没有 DNS 服务，那正是本缺陷的根因。
+	if strings.Contains(rs, "172.18.0.1") {
+		t.Fatalf("resolv.conf 不应指向网桥网关（无 DNS 服务），实际 %q", rs)
 	}
 	hf, err := os.ReadFile(filepath.Join(root, "etc", "hosts"))
 	if err != nil {

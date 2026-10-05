@@ -121,14 +121,34 @@ func writeDNSFiles(ip, gateway, hostname string) error {
 
 // writeDNSFilesTo 在给定 root 下写 etc/resolv.conf 与 etc/hosts（root=容器新根）。
 // root 拆出便于单测在临时目录验证、避免碰宿主 /etc。
+//
+// **DNS 来源**：优先用 `LICORE_NET_DNS` 环境变量——它由**宿主侧**
+// （engine/shim）在启动容器前探测并注入。
+//
+// 为什么不在容器内自己探测：本函数运行在容器 init 进程里（已 pivot_root），
+// `/run/systemd/resolve/resolv.conf` 与 `/etc/resolv.conf` 看到的都是**容器的**
+// 文件系统——前者不存在、后者是容器自己的。因此容器内探测**拿不到宿主上游**，
+// 只能走公共 DNS 兜底（实测确认：容器内读到的 /etc/resolv.conf 已是本函数
+// 自己写的内容，形成循环）。
+//
+// 环境变量缺失时（老版本 engine、单测直调）回退到容器内探测 → 公共 DNS，
+// 保证容器至少有解析器，不会出现"完全无法解析域名"。
 func writeDNSFilesTo(root, ip, gateway, hostname string) error {
 	etc := filepath.Join(root, "etc")
 	if err := os.MkdirAll(etc, 0o755); err != nil {
 		return fmt.Errorf("创建容器 %s: %w", etc, err)
 	}
-	// resolv.conf：指向桥接网关（LiCore 内置 DNS 的统一入口）。
-	resolv := fmt.Sprintf("nameserver %s\n", gateway)
-	if err := os.WriteFile(filepath.Join(etc, "resolv.conf"), []byte(resolv), 0o644); err != nil {
+	// resolv.conf：写入宿主侧探测到的上游 DNS。
+	//
+	// 不再写网桥网关：网关上没有 DNS 服务，写了等于让容器所有域名解析超时
+	// （真机实测 nslookup 报 connection timed out）。
+	nameservers := ParseNameserverList(os.Getenv(EnvNetDNS))
+	if len(nameservers) == 0 {
+		// 没有注入时退化为容器内探测（会走公共 DNS 兜底）。
+		nameservers = resolveNameservers()
+	}
+	if err := os.WriteFile(filepath.Join(etc, "resolv.conf"),
+		[]byte(formatResolvConf(nameservers)), 0o644); err != nil {
 		return fmt.Errorf("写 resolv.conf: %w", err)
 	}
 	// hosts：追加本机名与网关映射（保留既有 loopback 行，不覆盖）。

@@ -50,6 +50,27 @@ func NetEnv(mode network.NetMode, cid, name, ip, gateway, hostname string, prefi
 // <storeRoot>/networks/<name>.json 读取网关与子网，host/none 仅标注模式。
 // 解析失败时返回 nil 并告警（调用方维持现状启动，容器无网络但可运行）。
 func ResolveNetEnv(storeRoot, netName, containerID, hostname string) []string {
+	env := resolveNetEnvBase(storeRoot, netName, containerID, hostname)
+	// 追加宿主侧探测到的 DNS 上游。
+	//
+	// **必须在宿主侧探测**：写 resolv.conf 的代码在容器 init 里执行
+	// （已 pivot_root），那时读到的 /run/systemd/resolve/resolv.conf 与
+	// /etc/resolv.conf 都是**容器的**——前者不存在、后者是容器自己的，
+	// 因此容器内永远拿不到宿主真实上游（真机实测确认：容器内探测只能
+	// 走公共 DNS 兜底）。
+	//
+	// 本函数由 engine（前台）与 shim（detach）在**宿主侧**调用，是唯一能
+	// 读到宿主 DNS 配置的时机。结果经 LICORE_NET_DNS 传进容器。
+	if len(env) > 0 {
+		if ns := network.ResolveNameservers(); len(ns) > 0 {
+			env = append(env, network.EnvNetDNS+"="+strings.Join(ns, ","))
+		}
+	}
+	return env
+}
+
+// resolveNetEnvBase 是按网络模式解析装配参数的原实现。
+func resolveNetEnvBase(storeRoot, netName, containerID, hostname string) []string {
 	mode := network.ParseNetMode(netName)
 	switch mode {
 	case network.ModeHost:
