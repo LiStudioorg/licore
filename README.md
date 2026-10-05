@@ -7,9 +7,13 @@
 > 运行时容器内进程即宿主 root 且持有**全部** capability，既没有 cap-drop 也没有
 > seccomp：容器内 `echo b > /proc/sysrq-trigger` 可以直接重启宿主、可加载 eBPF、
 > 可改写宿主 `/proc/sys`。**如果你在用 v0.7.x 或更早版本，请不要运行不可信镜像。**
-> v0.8.0 起已默认启用 no_new_privs + capability 裁剪 + seccomp 黑名单，但这三层
-> **尚未在真机验证**，详见 [docs/unverified.md](docs/unverified.md) 与下方
-> [容器权限隔离](#容器权限隔离) 一节。
+>
+> 当前版本（**v0.9.5**）的隔离已**在真机验证**：no_new_privs + capability 裁剪 +
+> seccomp 黑名单，另有 procfs 挂载层封堵（`/proc/sys` 只读、
+> `/proc/sysrq-trigger` 屏蔽）与容器 → 宿主网络隔离。完整验证记录见
+> [docs/escape-audit.md](docs/escape-audit.md)；尚未覆盖的项见
+> [docs/unverified.md](docs/unverified.md)；已知限制见
+> [docs/known-limitations.md](docs/known-limitations.md)。
 
 > 用 Go 编写的轻量级容器引擎：无守护进程，2.3 MiB/容器，覆盖 Linux / Android / macOS；自研 `.licore` 镜像格式，不兼容 OCI。
 
@@ -323,19 +327,21 @@ licore run --memory 256m myapp:v1    # ✅ 生产环境应当这样写
 
 ## 容器权限隔离
 
-> **当前状态**：v0.8.0 起默认启用下面三层，但**尚未在真机验证过**——
-> 详见 [docs/unverified.md](docs/unverified.md)。在你自己确认之前，仍不建议
-> 用 LiCore 运行不可信镜像。
+> **当前状态**：v0.9.5 起隔离已**在真机验证**（含 3 条 P0 宿主逃逸路径的修复）。
+> 验证记录与逐条攻击面判定见 [docs/escape-audit.md](docs/escape-audit.md)。
+> 尚未覆盖的项见 [docs/unverified.md](docs/unverified.md)。
 
 v0.8.0 之前，容器在 root 下运行时就是**宿主 root 且持有全部 capability**，
 既没有 cap-drop 也没有 seccomp：容器内 `echo b > /proc/sysrq-trigger`
-可以直接重启宿主。v0.8.0 补上了三层防护：
+可以直接重启宿主。v0.8.0 补上了下面几层防护：
 
 | 层 | 默认行为 | 作用 |
 | --- | --- | --- |
 | `PR_SET_NO_NEW_PRIVS` | 始终开启 | 阻止经 execve 提权（setuid / file capabilities） |
 | capability 裁剪 | 丢光后只放回 Docker 默认集（14 项） | 拿掉 `CAP_SYS_ADMIN` / `CAP_NET_ADMIN` / `CAP_SYS_MODULE` 等 |
 | seccomp 黑名单 | 33 条危险系统调用返回 `EPERM`，另 1 条按参数拦截 | 纵深防御第二层：`reboot` / `init_module` / `ptrace` / `unshare` / `mount` / `process_vm_readv` / `kcmp` / `clone(CLONE_NEWUSER)` 等 |
+| **procfs 挂载层封堵**（v0.9.1） | `/proc/sys` 只读、`/proc/sysrq-trigger` 屏蔽 | 这三处**不受 capability 约束**（内核只做 DAC 检查），必须靠挂载层堵 |
+| **网络隔离**（v0.9.3） | 容器 → 宿主本机地址默认 DROP | 容器访问不到宿主上监听在通配地址的服务（SSH、管理端口等） |
 
 ```bash
 licore run myapp:v1                              # 默认集（与 Docker 默认一致）
@@ -661,8 +667,8 @@ LiCore 只认 `.licore`。这不是"还没做"，是设计选择（见 [docs/ima
 | **`licore boot enable`** | ⚠️ 部分 | systemd unit **生成与内容**已验证；未在真机实际 `enable` 并重启验证 |
 | **Windows** | ⚙️ 通过 WSL2 | 在 WSL2（或虚拟机）里安装 Linux 版 LiCore，与原生 Linux 体验一致；LiCore 本身不提供 Windows 原生后端。 |
 | **ARM / 386 / riscv64 真机运行** | ⚠️ 仅交叉编译 | 这些平台**能编译通过**，但未在对应硬件上运行验证 |
-| **容器权限隔离（v0.8.0 三层防护）** | ❌ 未在真机验证 | no_new_privs / capability 裁剪 / seccomp 的代码与单测已完成，seccomp 的安装与拦截在沙箱内已实测，但**没有在真实 root 服务器上确认过容器内的实际位图**。详见 [docs/unverified.md](docs/unverified.md) |
-| **`licore convert` 真机** | ⚠️ 仅 fake docker | 单镜像与批量转换的完整流程用注入的 fake docker 跑通（含失败路径），但**未在装了真实 docker 的机器上跑过** |
+| **容器权限隔离**（v0.9.5） | ✅ 已真机验证 | no_new_privs / capability 裁剪 / seccomp 三层 + procfs 挂载层封堵 + 容器→宿主网络隔离。真机确认容器 PID 1 与 exec 进程均为 `CapEff=0x00000000a80425fb`、`NoNewPrivs=1`、`Seccomp=2`；三条 P0 宿主逃逸路径（`/proc/sysrq-trigger`、`core_pattern`、`modprobe`）已封堵并复测。逐条攻击面判定见 [docs/escape-audit.md](docs/escape-audit.md) |
+| **`licore convert` 真机** | ✅ 已真机验证 | 真实 docker 上转换 `nginx:1.27-alpine` 并 `--import`，产物 20.3 MiB，ENTRYPOINT/CMD 等元数据完整；转换后的容器正常提供 HTTP 服务。批量路径仍只有 fake docker 覆盖 |
 
 > 我们宁可在 README 里写"没验证过"，也不希望你踩到才发现。发现文档与实现不符请
 > 直接开 issue——那属于 bug。

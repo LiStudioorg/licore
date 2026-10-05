@@ -307,7 +307,16 @@ download "$BASE/SHA256SUMS" "$WORK/SHA256SUMS" \
 
 info "校验完整性 ..."
 # 从 SHA256SUMS 中取出本资产的期望摘要。格式为 "<hex>  <name>"。
-expected="$(awk -v want="$ASSET.tar.gz" '$2 == want { print $1; exit }' "$WORK/SHA256SUMS")"
+#
+# **必须容忍文件名带 "./" 前缀**：`sha256sum *` 在部分环境（含本项目 Release
+# workflow 用的 busybox sha256sum）输出 `./name`，而 `sha256sum name` 输出
+# `name`——两种都是合法格式。只匹配不带前缀会让**所有用户在安装时被拒**。
+# 真机实测踩到过：Release 的 SHA256SUMS 里是 `./licore-linux-amd64.tar.gz`，
+# 而这里按不带前缀比较，报 "SHA256SUMS 中没有该资产的记录，拒绝安装"。
+expected="$(awk -v want="$ASSET.tar.gz" '
+  $2 == want       { print $1; exit }
+  $2 == "./" want  { print $1; exit }
+' "$WORK/SHA256SUMS")"
 [ -n "$expected" ] || die "SHA256SUMS 中没有 $ASSET.tar.gz 的记录，拒绝安装。" 4
 
 actual="$(hash_file "$WORK/$ASSET.tar.gz")"
