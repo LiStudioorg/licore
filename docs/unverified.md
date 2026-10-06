@@ -238,3 +238,46 @@ licore stop captest && licore rm captest
 > 注意：这与修复前正好相反——修复前 `licore exec ... grep CapEff` 读到的是
 > **宿主**的满能力位图，那正是"exec 未收口"的症状。
 
+
+---
+
+## `licore run` 参数"实际生效"审计（2026-10-06，真机 root）
+
+起因：`--cap-add/--cap-drop` 被发现在 `-d` 容器上静默失效（参数解析正常、
+config.json 也存对了，但没有下发到 init）。于是把所有参数按"**实际生效**"
+而非"解析正确"重测一遍。判据一律读**容器内真实状态**（PID 1 的
+`/proc/<pid>/status`、cgroup 限制文件、容器内命令输出），不看 config.json。
+
+| 参数 | 实测判据 | 结果 |
+| --- | --- | --- |
+| `--hostname h42` | 容器内 `hostname` | ✅ `h42` |
+| `--memory 96` | `memory.max` | ✅ `100663296` (96 MiB) |
+| `--memory-swap 128` | `memory.swap.max` | ✅ `33554432`（128−96=32 MiB，语义正确）|
+| `--pids-limit 24` | `pids.max` | ✅ `24` |
+| `--cpus 0.5` | `cpu.max` | ✅ `50000 100000` |
+| `--cpuset-cpus 0-1` | `cpuset.cpus` / `taskset -pc <PID1>` | ✅ `0-1`，affinity 实测 `0,1` |
+| `--cap-drop ALL` | PID 1 `CapEff` | ✅ `0000000000000000` |
+| `--cap-add SYS_ADMIN` | PID 1 `CapEff` | ✅ `00000000a82425fb`（含 bit 21）|
+| `--user 1000:1000` | PID 1 `Uid`/`Gid` | ✅ `1000/1000` |
+| `--workdir /tmp` | `/proc/<PID1>/cwd` | ✅ `/tmp` |
+| `-e AA=bb` | PID 1 `environ` | ✅ `AA=bb` |
+| `--ip 172.22.0.250` | 容器内 `hostname -i` | ✅ `172.22.0.250` |
+| `-p 18124:80` | `iptables -t nat -S` | ✅ 2 条规则 |
+| `--restart always` | config + 重启行为 | ✅ `always` |
+| `--network none` | 容器内接口数 | ✅ 1（仅 lo）|
+| `--entrypoint` | 覆盖后的 argv | ✅ 生效 |
+| `-v` / `--volume` | 见既有 v0.6.0 验收（挂载 + `:ro`）| ✅（历史验收）|
+| `--blkio-weight` / `--storage` / `--gpu` / `--npu` / `--network-bandwidth` | CLI 显式拒绝（`ErrUnsupported`）| ✅ 不静默降级 |
+
+**未覆盖**：`--memory-reservation`（软限制，v2 无直接对应文件的语义差异未单独
+验证）；cgroup v1 路径下的上述项（本机是 v2）。
+
+### 本轮据此修掉的三个静默失效
+
+1. `--cap-add` / `--cap-drop`：shim 路径漏下发 `CapsEnv`（`4f3b7ac`）。
+2. `--user` / `--workdir`：从未下发到 init，也从未在 exec 侧降权（`9018747`）。
+3. `--cpuset-cpus`：cgroup v2 的 `subtree_control` 漏 enable `cpuset`（`1c84d84`）。
+
+三者共同特征：**参数解析与持久化都正确，只在最后一段断掉，且失败是静默的**
+（要么恰好等于默认值，要么写入被内核忽略）。因此本表的判据必须是
+"容器内真实状态"，不能是 config.json 或命令退出码。
