@@ -82,6 +82,19 @@ func Run(ctx context.Context, o *Options) error {
 		env = append(env, runtime.ResolveNetEnv(st.Root, cfg.Network, cfg.ID, cfg.Hostname)...)
 		env = append(env, runtime.MountEnv(cfg.Mounts)...)
 		env = append(env, runtime.CgroupEnv(cfg.ID)...)
+		// 能力裁剪规格必须在这里下发。
+		//
+		// **曾经漏了这一行**，而 `licore run -d` 正是走这条 shim 路径 ——
+		// 后果是从 v0.7.x 起，`-d` 创建的容器上 `--cap-add` / `--cap-drop`
+		// **静默失效**：config.json 里存着正确的 capDrop/capAdd，但 init 的
+		// 环境里根本没有 LICORE_CAPS_*，capsFromEnv 读到空值后就退回内置
+		// 默认集——恰好等于"没传参数"的结果，因此不报错、不告警，
+		// 只有读容器 PID 1 的 CapEff 才能看出。
+		//
+		// engine.go 的前台路径一直有这一行（`--cap-*` 在前台模式下是好的），
+		// 两条路径各写各的才漏掉。**新增任何启动路径时，这份 env 必须与本
+		// 行保持一致**；TestStartEnvMatchesEngine 会守住这个不变量。
+		env = append(env, runtime.CapsEnv(cfg.CapDrop, cfg.CapAdd)...)
 		res, err := startWithFn(&runtime.Config{
 			Rootfs:   cfg.Rootfs,
 			Hostname: cfg.Hostname,
