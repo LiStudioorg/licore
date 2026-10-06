@@ -207,6 +207,7 @@ func newExportCommand(out io.Writer) *cobra.Command {
 // newImportCommand 实现 `licore import file.licore`。
 func newImportCommand(out io.Writer) *cobra.Command {
 	var root string
+	var allowArchMismatch bool
 	cmd := &cobra.Command{
 		Use:   "import FILE",
 		Short: "导入 .licore 文件为本地镜像",
@@ -219,7 +220,10 @@ func newImportCommand(out io.Writer) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			loaded, err := ImportImage(st, args[0], "", ImportOptions{Force: true})
+			loaded, err := ImportImage(st, args[0], "", ImportOptions{
+				Force:             true,
+				AllowArchMismatch: allowArchMismatch,
+			})
 			if err != nil {
 				return err
 			}
@@ -228,5 +232,12 @@ func newImportCommand(out io.Writer) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&root, "data-dir", "", "数据目录")
+	// --allow-arch-mismatch 对应规范第 4 节规则 6 的逃生口（store.Put 的同名参数）。
+	// 此前该能力只在 `convert --arch` / `build --arch` 内部可达，**没有任何 CLI
+	// 入口**，因此"把一个异构 .licore 文件导入本机 store"这件事无法完成——
+	// 恢复交叉构建产物、或从别处拿到的异构镜像时会卡在平台校验上，且没有官方
+	// 途径绕过（只能手工改 index.json 再重打包，而规范禁止那样做）。
+	cmd.Flags().BoolVar(&allowArchMismatch, "allow-arch-mismatch", false,
+		"跳过宿主平台校验，导入异构架构的镜像（层摘要仍会完整校验）")
 	return cmd
 }
