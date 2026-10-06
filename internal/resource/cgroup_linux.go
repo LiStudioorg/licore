@@ -27,7 +27,13 @@ func Available() bool {
 // controllers 需要开给 licore 子组的控制器，写进 <licore>/cgroup.subtree_control。
 // 注意：只有此处 enable 后，licore/<id>/cpu.max|memory.max|pids.max 等才可写；
 // 若不 enable，cgroup v2 子组写这些限制会 EPERM（此前 --memory/--cpus 静默落空）。
-const controllers = "cpu memory pids"
+//
+// **cpuset 必须在这里**：漏掉它会重现同一类静默失效——子组的
+// cpuset.cpus 不可写，`--cpuset-cpus` 于是完全没效果（真机实测：
+// 传 --cpuset-cpus 0 后 cpuset.cpus 仍为空，而父组显示 0-3）。
+// v1 的实现（cgroup_v1_linux.go）本来就按需 enable cpuset，补齐 v2 是为了
+// 两条路径语义一致。
+const controllers = "cpu memory pids cpuset"
 
 // enableControllers 在 licore 父组的 cgroup.subtree_control 里启用容器限制所需
 // 的控制器（cpu/memory/pids）。已在更外层启用时追加挂到本组；幂等、容错。
