@@ -31,22 +31,46 @@
 令牌被拒），真机验证只剩"部署后实际调用 Hub API 伪造失败"这一端到端确认，
 不是修复本身未验证。仍登记在此，以免被当成已端到端验证。
 
-### 待真机验证的安全项（**本清单的核心**）
+### 真机验证结果（2026-10-05/06，本机 45.207.198.91，root）
 
-审计 v2 的 A 类（容器逃逸）与 B 类（网络隔离）**本次一条都未验证**——
-沙箱 `CapEff=0`，无法创建容器。验证脚本已就绪：
+审计 v2 的 A 类（容器逃逸）与 B 类（网络隔离）**已在真机执行**：
 [scripts/verify-security.sh](../scripts/verify-security.sh)
+结果 **PASS=26 / FAIL=0 / SKIP=4**。
 
 | 脚本节 | 覆盖 | 状态 |
 | --- | --- | --- |
-| T-1 | CapEff/NoNewPrivs/Seccomp、`/proc/sys` 只读、sysrq mask、**`/proc/mtrr`**、设备节点、seccomp 实拦、PID ns | ⏳ 未跑 |
-| T-2 | `exec` 收口（位图须与容器 PID 1 一致）、`--cap-add` 被拒 | ⏳ 未跑 |
-| T-3 | 容器→宿主阻断、出网、端口映射回包、LICORE-INPUT/nft | ⏳ 未跑 |
-| T-4 | `exec` 的 cgroup 归置（v0.9.2 修复的回归）| ⏳ 未跑 |
-| T-5 | 卷 `:ro` 真正只读 | ⏳ 未跑 |
-| T-6 | **DESTRUCTIVE** sysrq 真实写入（默认跳过，须 `--unsafe`）| ⏳ 未跑 |
+| T-1 | CapEff/NoNewPrivs/Seccomp、`/proc/sys` 只读、sysrq mask、**`/proc/mtrr`**、设备节点、PID ns | ✅ 全 PASS |
+| T-2 | `exec` 收口（位图与容器 PID 1 一致）、`--cap-add` 被拒 | ✅ 全 PASS |
+| T-3 | 容器→宿主阻断、LICORE-INPUT 规则 | ✅ PASS（出网/端口映射见下） |
+| T-4 | `exec` 的 cgroup 归置（v0.9.2 修复的回归）| ✅ PASS |
+| T-5 | 卷 `:ro` 真正只读 | ✅ PASS |
+| T-6 | **DESTRUCTIVE** sysrq 真实写入（默认跳过，须 `--unsafe`）| ⏳ **刻意未跑**（以 write 探测替代，见下） |
 
-> 用法：`sudo bash scripts/verify-security.sh`，跑完把完整输出贴回审计会话。
+**T-3 的出网与端口映射**：脚本内 SKIP（其隔离数据目录与宿主既有网桥网段
+不一致所致，即 [L-6](known-limitations.md)），已用生产数据目录**手工补验**：
+容器 ping 网关 / `8.8.8.8` 均 0% loss、DNS 解析成功、经宿主 eth0 的端口
+映射返回 HTTP 200。**结论：功能正常**，SKIP 是脚本自身的数据目录选择所致。
+
+**T-6 为何不跑**：写 `/proc/sysrq-trigger` 会**真的重启宿主**，而 T-1.3a
+已用真实 `write(2)` 探测确认该文件被拒（同一 open/write 路径），结论已闭合，
+故不冒险执行。
+
+**仍未验证**（**不在上表内，勿混为一谈**）：
+- Android（有 Root）与 macOS 平台 —— 本机是 x86_64 服务器；
+- 嵌套容器、systemd 容器等复杂负载；
+- `trivy` 文件系统 / 配置扫描（工具未安装）。
+
+### L-6 网桥网段校验（v0.9.7，真机已验证）
+
+| 项 | 代码 | 真机 | 说明 |
+| --- | --- | --- | --- |
+| 复用既有网桥前校验网段 | ✅ | ✅ **已验 + 反向验证** | commit `0a97664` |
+| `ensurePreset` 采用既有网桥网段 | ✅ | ✅ **已验** | 根因修复 |
+
+真机 A/B：漏洞版 `run` 退出码 0、容器 Up、`ping` 100% loss；
+修复版退出码 1、明确报错、不留容器。
+反向验证见 [security-audit-v2.md](security-audit-v2.md) 的
+《L-6 修复记录》一节（含测试假阴性的教训）。
 
 ---
 
