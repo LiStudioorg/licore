@@ -154,6 +154,23 @@ func (m *Manager) Remove(name string) error {
 func (m *Manager) path(name string) string { return filepath.Join(m.networksRoot(), name+".json") }
 
 // ensurePreset 无条件确保预置 licore0 存在（不存在则创建）。
+//
+// **关键：如果宿主上已经有同名网桥，必须采用它真实的网段，而不是另分配一个。**
+//
+// 曾经的写法是无条件 `pickFreeSubnet`。而 pickFreeSubnet 会**跳过
+// licore0 自己的路由**（见 subnetRoutedByOther：`iface == PresetBridgeName
+// … continue`，本意是"不要被自己绊倒"），于是它看不见既有网桥占的
+// 172.22.0.0/16，很自然地选出 172.21.0.0/16：
+//
+//	宿主网桥实际  : 172.22.0.1/16   （还在，继续服务老容器）
+//	新数据目录定义: 172.21.0.1/16   （凭空分配，网桥上根本没有这个地址）
+//
+// 之后 driverBootstrap 复用同名网桥 → 容器默认路由指向不存在的
+// 172.21.0.1 → 容器 Up 但完全没网（L-6）。
+//
+// 正确的语义是"**既有的网桥是事实来源**"：它上面配了什么，本数据目录就
+// 该记什么。这样多数据目录共用同一宿主时彼此一致，也不会与既有容器打架。
+// 只有当宿主上还没有网桥时，才需要本数据目录自己挑一个空闲网段。
 func (m *Manager) ensurePreset() error {
 	if _, err := os.Stat(m.path(PresetBridgeName)); err == nil {
 		return nil
@@ -161,12 +178,22 @@ func (m *Manager) ensurePreset() error {
 		return fmt.Errorf("检查预置网络失败: %w", err)
 	}
 	n := New(PresetBridgeName, DriverBridge)
-	subnet, gateway := pickFreeSubnet(PresetBridgeSubnet)
-	n.Subnet, n.Gateway = subnet, gateway
+
+	if subnet, gateway, ok := existingBridgeSubnet(PresetBridgeName); ok {
+		// 复用既有网桥的网段。
+		n.Subnet, n.Gateway = subnet, gateway
+		slog.Info("复用宿主上既有网桥的网段",
+			"net", PresetBridgeName, "subnet", subnet, "gateway", gateway)
+	} else {
+		subnet, gateway := pickFreeSubnet(PresetBridgeSubnet)
+		n.Subnet, n.Gateway = subnet, gateway
+	}
+
 	if err := m.Save(n); err != nil {
 		return err
 	}
 	// 尝试创建宿主网桥；失败不致命（容器管理仍可用）。
+	// 注意：复用既有网桥时上面的网段已与它一致，这里不会再报不匹配。
 	if err := driverBootstrap(n); err != nil {
 		slog.Warn("预置网桥创建失败，请以 root 运行", "net", PresetBridgeName, "err", err)
 	}

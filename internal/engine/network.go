@@ -114,6 +114,16 @@ func wireNetworkBeforeStart(st *store.Store, cfg *store.ContainerConfig, netName
 		return fmt.Errorf("接入网络 %s 失败: %w", netName, err)
 	}
 	if err := m.EnsureDriver(netName); err != nil {
+		// 绝大部分失败确实是"当前没有 CAP_NET_ADMIN"（非 root 跑），
+		// 此时降级为警告、让容器以无网方式起来，是既定语义。
+		//
+		// **但网桥网段不一致必须致命**：那不是权限问题，而是宿主的既有网桥
+		// 与本网络定义冲突。继续跑下去会得到一个默认路由指向不存在网关的
+		// 容器 —— "起来了、ps 显示 Up、却完全没网，且没有任何报错"，
+		// 比直接启动失败难排查得多（L-6，2026-07 真机实测）。
+		if errors.Is(err, network.ErrBridgeSubnetMismatch) {
+			return fmt.Errorf("接入网络 %s 失败: %w", netName, err)
+		}
 		slog.Warn("网络网桥未就绪（可能无 root），veth 装配可能失败", "net", netName, "err", err)
 	}
 	// 清理历史残留端点（容器已不存在的端点仍会被 ApplyNAT 登记 DNAT，指到死

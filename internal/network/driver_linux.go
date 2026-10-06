@@ -41,8 +41,24 @@ func driverBootstrap(n *Network) error {
 		return nil
 	}
 	br := bridgeHostIface(n)
-	if _, err := netlink.LinkByName(br); err == nil {
-		return nil // 已存在，幂等
+	if _, err := linkByNameFn(br); err == nil {
+		// 网桥已存在：**必须先核对网段，不能直接复用**。
+		//
+		// 曾经的写法是 `return nil // 已存在，幂等`，只看名字、不看地址。
+		// 后果（2026-10-05 真机实测）：宿主上已有 licore0（172.22.0.1/16），
+		// 而一个新数据目录按自己的分配器给出 172.21.0.0/16 —— 网桥被
+		// "复用"，容器拿到 172.21.0.2 + 网关 172.21.0.1，但网桥上根本没有
+		// 这个地址，于是容器默认路由指向不存在的下一跳：
+		//
+		//     容器内 ping <真实网关>  → 100% packet loss
+		//     容器内 ping 8.8.8.8    → 100% packet loss
+		//
+		// 容器**起来了**（ps 显示 Up）、**没有任何报错**，只是完全没有网络。
+		// 这是最难排查的一类失败形态。
+		if err := checkBridgeSubnet(br, n); err != nil {
+			return err
+		}
+		return nil
 	}
 	if err := netlink.NewLink(br, netlink.KindBridge); err != nil {
 		return fmt.Errorf("创建网桥 %s: %w", br, err)
@@ -59,6 +75,62 @@ func driverBootstrap(n *Network) error {
 		return fmt.Errorf("为网桥添加网关 %s/%d: %w", n.Gateway, ones, err)
 	}
 	return nil
+}
+
+// bridgeAddrs 读取网桥上的 IPv4 地址。抽成变量便于测试注入，
+// 与 forward_linux.go 的 bridgeOwnAddrs 同一约定（真机 netlink 在
+// 单元测试环境里不一定可用）。
+var bridgeAddrs = func(iface string) ([]netlink.IfAddr, error) {
+	return netlink.ListAddrs(iface)
+}
+
+// linkByNameFn 查链路。同样抽成变量：单元测试里宿主不一定有 licore0
+// （在 CI / 干净容器里就没有），需要能注入"网桥已存在"这条分支。
+var linkByNameFn = netlink.LinkByName
+
+// checkBridgeSubnet 校验已存在网桥的地址是否与本网络定义一致；不一致则报错。
+//
+// 判据：网桥上**存在一个与本网络 Gateway/Subnet 完全吻合的地址**。
+// 只要吻合就放行——网桥可能同时挂多个地址（合法用法），不能要求"只有它一个"。
+//
+// 之所以按"网段 + 网关"一起比而不是只比网段：网关是容器默认路由的下一跳，
+// 它必须真的在网桥上，否则同样连不通。只对网段会漏掉"网段对但网关选错"
+// 的情况。
+func checkBridgeSubnet(br string, n *Network) error {
+	addrs, err := bridgeAddrs(br)
+	if err != nil {
+		return fmt.Errorf("校验网桥 %s 的网段: %w", br, err)
+	}
+	_, want, err := net.ParseCIDR(n.Subnet)
+	if err != nil {
+		return fmt.Errorf("网段 %s 非法: %w", n.Subnet, ErrBadNetwork)
+	}
+	wantOnes, _ := want.Mask.Size()
+
+	// 展示用：把网桥上现有的 IPv4 地址列出来，便于用户判断。
+	// 一个地址都没有（网桥刚建好还没配）也算不匹配——那样容器同样没网。
+	got := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		got = append(got, a.String())
+		if a.IP != n.Gateway || a.Prefix != wantOnes {
+			continue
+		}
+		// 网关地址吻合，再确认它确实落在本网络声明的网段内。
+		if ip := net.ParseIP(a.IP); ip != nil && want.Contains(ip) {
+			return nil
+		}
+	}
+
+	existing := "（无 IPv4 地址）"
+	if len(got) > 0 {
+		existing = strings.Join(got, ", ")
+	}
+	return fmt.Errorf(
+		"网桥 %s 已存在，但其地址 %s 与本网络定义（网关 %s，网段 %s）不一致；"+
+			"拒绝复用以避免容器起来后无网络：%w。"+
+			"处置：改用创建该网桥时的数据目录（LICORE_HOME），"+
+			"或先删除该网桥（licore network rm %s）再重试",
+		br, existing, n.Gateway, n.Subnet, ErrBridgeSubnetMismatch, n.Name)
 }
 
 // driverTeardown 删除网络在宿主侧的网桥。
@@ -396,3 +468,29 @@ func (n *Network) removePortRules(veth string) error {
 
 var _ = hostDefaultIface
 var _ = netlink.KindVeth
+
+// existingBridgeSubnet 读取宿主上既有网桥的 IPv4 网段与网关。
+//
+// 返回 ok=false 表示"网桥不存在 / 没有 IPv4 地址 / 读不到"，调用方应自行
+// 挑选网段。取**第一个** IPv4 地址作为该网桥的网段：licore 自己创建的网桥
+// 只会有这一个地址；网桥挂多地址是合法用法，但那种情况下以第一个为准是
+// 保守且可预期的选择。
+func existingBridgeSubnet(ifname string) (subnet, gateway string, ok bool) {
+	addrs, err := bridgeAddrs(ifname)
+	if err != nil || len(addrs) == 0 {
+		return "", "", false
+	}
+	a := addrs[0]
+	if a.Prefix <= 0 || a.Prefix > 32 {
+		return "", "", false
+	}
+	ip := net.ParseIP(a.IP).To4()
+	if ip == nil {
+		return "", "", false
+	}
+	_, ipnet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", a.IP, a.Prefix))
+	if err != nil {
+		return "", "", false
+	}
+	return ipnet.String(), a.IP, true
+}

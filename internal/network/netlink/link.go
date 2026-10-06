@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 	"syscall"
 )
 
@@ -221,6 +222,70 @@ func AddAddr(ifname, ip string, prefix int) error {
 	r.addAttr(IFA_ADDRESS, netIP4(ip))
 	_, err := r.do()
 	return err
+}
+
+// IfAddr 是接口上的一个 IPv4 地址。
+type IfAddr struct {
+	IP     string // 如 "172.22.0.1"
+	Prefix int    // 如 16
+}
+
+// String 返回 CIDR 形式，便于比较与报错信息展示。
+func (a IfAddr) String() string { return fmt.Sprintf("%s/%d", a.IP, a.Prefix) }
+
+// ListAddrs 列出接口上的全部 IPv4 地址（RTM_GETADDR + NLM_F_DUMP 后按 index 过滤）。
+//
+// 用于"复用已存在的网桥前先核对网段"：接口存在只说明名字撞了，
+// 不说明它的地址就是本网络定义的那个（见 driverBootstrap 与
+// ErrBridgeSubnetMismatch）。只收集 AF_INET，IPv6 不参与判断。
+//
+// 必须带 NLM_F_DUMP：不带时内核回 EOPNOTSUPP（真机实测报
+// "rtnetlink get-addr: operation not supported"，在 lo / licore0 /
+// docker0 上均如此）。
+func ListAddrs(ifname string) ([]IfAddr, error) {
+	idx := mustIndex(ifname)
+	// ifaddrmsg 只填 family 与 index，前缀长度留给内核按每条地址回填。
+	msg := make([]byte, 8)
+	msg[0] = syscall.AF_INET
+	binary.LittleEndian.PutUint32(msg[4:8], idx)
+
+	r := newReq(RTM_GETADDR, NLM_F_DUMP, msg)
+	msgs, err := r.do()
+	if err != nil {
+		return nil, fmt.Errorf("列出 %s 的地址: %w", ifname, err)
+	}
+
+	var out []IfAddr
+	for _, m := range msgs {
+		if m.Type != RTM_NEWADDR || len(m.Data) < 8 {
+			continue
+		}
+		// struct ifaddrmsg：family[0] prefixlen[1] flags[2] scope[3] index[4:8]
+		if m.Data[0] != syscall.AF_INET {
+			continue
+		}
+		if binary.LittleEndian.Uint32(m.Data[4:8]) != idx {
+			continue
+		}
+		attrs, err := parseAttrs(m.Data[8:])
+		if err != nil {
+			continue
+		}
+		// IFA_ADDRESS 是接口地址；点对点链路上 IFA_LOCAL 才是本端地址，
+		// 两者都有时优先 IFA_LOCAL。
+		b := attrBytes(attrs, IFA_LOCAL)
+		if len(b) < 4 {
+			b = attrBytes(attrs, IFA_ADDRESS)
+		}
+		if len(b) < 4 {
+			continue
+		}
+		out = append(out, IfAddr{
+			IP:     net.IP(b[:4]).String(),
+			Prefix: int(m.Data[1]),
+		})
+	}
+	return out, nil
 }
 
 // DelAddr 移除接口上的 IP。
