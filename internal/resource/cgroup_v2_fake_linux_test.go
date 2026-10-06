@@ -16,6 +16,11 @@ import (
 
 // fakeV2Root 造一个可写的假 cgroup v2 根：含 cgroup.controllers，
 // 并把 v2 seam 指过来。写路径全部落在临时目录，不触碰宿主 /sys/fs/cgroup。
+//
+// cgroup.controllers 用 controllers 常量派生，而不是硬编码一份列表：
+// 真实内核对 subtree_control 的写入会校验控制器是否**可用**，
+// 硬编码的假列表一旦落后于常量（本次给 controllers 补 io 时就撞上），
+// 测试会以"写不进去"的形式假失败，而那不是被测代码的问题。
 func fakeV2Root(t *testing.T) string {
 	t.Helper()
 	root := filepath.Join(t.TempDir(), "cgroup2")
@@ -23,7 +28,7 @@ func fakeV2Root(t *testing.T) string {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "cgroup.controllers"),
-		[]byte("cpu memory pids io\n"), 0o644); err != nil {
+		[]byte(controllers+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	old := cgroupV2GroupRoot
@@ -34,7 +39,58 @@ func fakeV2Root(t *testing.T) string {
 	oldV1 := v1ModeOverride
 	v1ModeOverride = ""
 	t.Cleanup(func() { v1ModeOverride = oldV1 })
+	installFakeKernelSubtreeControl(t, root)
 	return root
+}
+
+// installFakeKernelSubtreeControl 让假 cgroup 根的 subtree_control 具备**内核语义**：
+//
+//  1. 累加：`+cpu` 之后内容是 "cpu"，再 `+memory` 变成 "cpu memory"；
+//     普通文件是覆盖语义，会让"逐个写控制器"看起来只生效最后一个。
+//  2. 校验：只接受 cgroup.controllers 里列出的控制器，其余返回 ENOENT
+//     —— 这正是真机上"宿主 root 未 delegate cpuset 时写 +cpuset 报 ENOENT"
+//     的行为，是 enableControllers 逐个写要处理的场景。
+//
+// 注入了它，无特权环境就能覆盖"某个控制器不可用"与"其余仍然生效"两条真实路径。
+func installFakeKernelSubtreeControl(t *testing.T, root string) {
+	t.Helper()
+	old := writeSubtreeControl
+	writeSubtreeControl = func(path string, data []byte, perm os.FileMode) error {
+		if filepath.Base(path) != "cgroup.subtree_control" {
+			return old(path, data, perm)
+		}
+		avail, _ := os.ReadFile(filepath.Join(root, "cgroup.controllers"))
+		have := map[string]bool{}
+		for _, c := range strings.Fields(string(avail)) {
+			have[c] = true
+		}
+		cur := map[string]bool{}
+		if b, err := os.ReadFile(path); err == nil {
+			for _, c := range strings.Fields(string(b)) {
+				cur[strings.TrimPrefix(c, "+")] = true
+			}
+		}
+		for _, tok := range strings.Fields(string(data)) {
+			name := strings.TrimPrefix(strings.TrimPrefix(tok, "+"), "-")
+			if !have[name] {
+				return &os.PathError{Op: "write", Path: path, Err: os.ErrNotExist}
+			}
+			if strings.HasPrefix(tok, "-") {
+				delete(cur, name)
+			} else {
+				cur[name] = true
+			}
+		}
+		// 按 controllers 常量顺序输出，保证结果可复现。
+		var out []string
+		for _, c := range strings.Fields(controllers) {
+			if cur[c] {
+				out = append(out, c)
+			}
+		}
+		return os.WriteFile(path, []byte(strings.Join(out, " ")), perm)
+	}
+	t.Cleanup(func() { writeSubtreeControl = old })
 }
 
 // removeFakeCgroupDirContents 清空假 cgroup 目录（模拟 cgroupfs 的 rmdir
@@ -262,7 +318,7 @@ func TestV2EnableControllersIdempotentWithIO(t *testing.T) {
 		[]byte(controllers+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := enableControllers(); err != nil {
+	if _, err := enableControllers(); err != nil {
 		t.Fatal(err)
 	}
 	if got := readFake(t, filepath.Join(parent, "cgroup.subtree_control")); got != controllers {
@@ -383,5 +439,45 @@ func TestCgroupModeDispatch(t *testing.T) {
 	cgroupV1Roots = []string{v1Root}
 	if m := CgroupModeOf(); m != ModeV2 {
 		t.Fatalf("混合层级时 v2 必须优先, got %q", m)
+	}
+}
+
+// TestSetupV2RejectsUnsupportedRequestedLimit 是本次静默失效的回归测试。
+//
+// 背景（真机实测 2026-10-06）：宿主 root 的 cgroup.subtree_control 未 delegate
+// cpuset/io 时，enableControllers 把 "+cpu +memory +pids +cpuset" 一次写下去，
+// 内核因 cpuset 不可用而让**整条写入** ENOENT —— 结果 --memory/--cpus/--pids-limit
+// 全部静默失效，容器照常启动且看不出异常（memory.max 文件压根不存在）。
+//
+// 现在的要求是两条：可用的控制器必须仍然生效；用户**显式请求**了却无法生效的
+// 限制必须让 Setup 报错，而不是放行一个"以为自己有上限"的容器。
+func TestSetupV2RejectsUnsupportedRequestedLimit(t *testing.T) {
+	root := fakeV2Root(t)
+	// 宿主只提供 cpu/memory/pids，没有 cpuset/io。
+	if err := os.WriteFile(filepath.Join(root, "cgroup.controllers"),
+		[]byte("cpu memory pids\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1) 未请求 cpuset/io 的容器：应当正常创建，且 cpu/memory/pids 生效。
+	if _, err := Setup("ok1", &Limits{Memory: 64 << 20, PidsLimit: 32, CPUs: 1}); err != nil {
+		t.Fatalf("未请求不可用控制器，Setup 不应失败: %v", err)
+	}
+	got := readFake(t, filepath.Join(root, LiCoreGroup, "ok1", "memory.max"))
+	if got != strconv.Itoa(64<<20) {
+		t.Errorf("memory.max = %q，期望 %d（关键：cpuset 不可用不应拖垮 memory）",
+			got, 64<<20)
+	}
+
+	// 2) 显式请求 cpuset 的容器：必须报错，不能静默放行。
+	if _, err := Setup("bad1", &Limits{CPUSet: "0-1"}); err == nil {
+		t.Fatal("请求 --cpuset-cpus 但宿主不支持 cpuset 时，Setup 必须报错")
+	} else if !errors.Is(err, ErrUnsupported) {
+		t.Errorf("错误应包装 ErrUnsupported，实得 %v", err)
+	}
+
+	// 3) 显式请求 blkio 的容器：同样必须报错。
+	if _, err := Setup("bad2", &Limits{BlkioWeight: 500}); err == nil {
+		t.Fatal("请求 --blkio-weight 但宿主不支持 io 时，Setup 必须报错")
 	}
 }

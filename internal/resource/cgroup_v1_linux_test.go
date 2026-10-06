@@ -508,6 +508,7 @@ func withV2GroupRoot(t *testing.T, root string) {
 func TestEnableControllersCreatesParentGroup(t *testing.T) {
 	root := t.TempDir()
 	withV2GroupRoot(t, root)
+	installFakeKernelSubtreeControl(t, root)
 
 	// 造出 v2 的可用标记，并把控制器列表写进去。
 	if err := os.WriteFile(filepath.Join(root, "cgroup.controllers"), []byte("cpu memory pids\n"), 0o644); err != nil {
@@ -518,17 +519,23 @@ func TestEnableControllersCreatesParentGroup(t *testing.T) {
 		t.Fatalf("前置条件：%s 不应存在", group)
 	}
 
-	if err := enableControllers(); err != nil {
+	if _, err := enableControllers(); err != nil {
 		t.Fatalf("enableControllers 应自动创建父组: %v", err)
 	}
 	fi, err := os.Stat(group)
 	if err != nil || !fi.IsDir() {
 		t.Fatalf("父组 %s 未被创建: %v", group, err)
 	}
+	// 真实 cgroupfs 会把写入的 "+cpu" 规范化为文件里的 "cpu"，因此按
+	// **空格切分后的 token** 比对，而不是找字面量 "+cpu"。
 	got := readTestFile(t, filepath.Join(group, "cgroup.subtree_control"))
+	have := map[string]bool{}
+	for _, f := range strings.Fields(got) {
+		have[strings.TrimPrefix(f, "+")] = true
+	}
 	for _, c := range []string{"cpu", "memory", "pids"} {
-		if !strings.Contains(got, "+"+c) {
-			t.Errorf("subtree_control 缺少 +%s: %q", c, got)
+		if !have[c] {
+			t.Errorf("subtree_control 缺少 %s: %q", c, got)
 		}
 	}
 }
@@ -538,13 +545,14 @@ func TestEnableControllersCreatesParentGroup(t *testing.T) {
 func TestEnableControllersIdempotent(t *testing.T) {
 	root := t.TempDir()
 	withV2GroupRoot(t, root)
+	installFakeKernelSubtreeControl(t, root)
 	// 用 controllers 常量派生可用控制器列表，而不是硬编码 ——
 	// 否则常量一变（如补上 cpuset）这条幂等用例就会假失败。
 	if err := os.WriteFile(filepath.Join(root, "cgroup.controllers"), []byte(controllers+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	for i := range 3 {
-		if err := enableControllers(); err != nil {
+		if _, err := enableControllers(); err != nil {
 			t.Fatalf("第 %d 次 enableControllers: %v", i+1, err)
 		}
 	}
@@ -552,15 +560,16 @@ func TestEnableControllersIdempotent(t *testing.T) {
 	// 已启用后不应再写（内容保持首次写入的结果）。
 	//
 	// 必须按**空格切分后的完整 token** 计数，不能对整串做子串计数：
-	// "+cpu" 是 "+cpuset" 的子串，子串计数会把 cpuset 误算成 cpu 的第二次出现
-	// （本次给 controllers 补 cpuset 时就被这条绊了一下）。
+	// 子串计数会把 cpuset 误算成 cpu 的第二次出现（给 controllers 补 cpuset
+	// 时就被这条绊过）。真实 cgroupfs 的 token 是裸控制器名（无 "+"），
+	// 所以按去前缀后的名字计数，两种写法都能覆盖。
 	counts := map[string]int{}
 	for _, f := range strings.Fields(got) {
-		counts[f]++
+		counts[strings.TrimPrefix(f, "+")]++
 	}
 	for _, c := range strings.Fields(controllers) {
-		if counts["+"+c] != 1 {
-			t.Errorf("+%s 应恰好出现一次，实得 %d 次: %q", c, counts["+"+c], got)
+		if counts[c] != 1 {
+			t.Errorf("%s 应恰好出现一次，实得 %d 次: %q", c, counts[c], got)
 		}
 	}
 }

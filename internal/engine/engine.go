@@ -191,9 +191,21 @@ func Run(ctx context.Context, st *store.Store, spec *RunSpec) (*RunResult, error
 		return nil, err
 	}
 	// 资源限制：创建容器专属 cgroup 并写入限制（哪怕空限制也建组，便于 stats）。
-	// 失败仅告警（无 cgroups v2 / 无 root 时降级），init PID 写入由 runtime 完成。
+	// init PID 写入由 runtime 完成。
+	//
+	// **用户显式请求了限制时，失败必须中止启动**：此前一律降级为 WARN，
+	// 结果是"参数解析正确、config.json 也存对了，但限制根本没生效"——
+	// 这正是本仓库反复出现的那类静默失效（--cap-add / --user / --cpuset-cpus
+	// / --blkio-weight 都是同一形态）。运行一个"以为自己有内存上限、
+	// 实际没有"的容器，比直接启动失败危险得多：用户会据此以为 OOM 已被隔离。
+	// 只有**空限制**（用户没提任何资源参数，建组只为 stats）才允许降级告警。
 	if _, err := resource.Setup(cfg.ID, spec.Limits); err != nil {
-		slog.Warn("创建容器 cgroup 失败（可能需要 root 或 cgroups v2）", "container", cfg.ID, "err", err)
+		if spec.Limits != nil && !spec.Limits.Empty() {
+			disconnectContainer(st, cfg)
+			_ = st.RemoveContainer(cfg.ID)
+			return nil, fmt.Errorf("应用资源限制失败（参数已解析但无法生效，拒绝以无限制方式启动）: %w", err)
+		}
+		slog.Warn("创建容器 cgroup 失败（无限制请求，仅 stats 受影响）", "container", cfg.ID, "err", err)
 	}
 
 	res := &RunResult{Container: cfg, ShortID: id, Foreground: !spec.Detach, ExitCode: -1}
