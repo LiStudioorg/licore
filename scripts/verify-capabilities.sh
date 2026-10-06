@@ -88,7 +88,20 @@ cleanup_verify() {
   if command -v docker >/dev/null 2>&1; then
     docker rm -f "$DOCKER_CMP" >/dev/null 2>&1 || true
   fi
-  rm -rf "$VERIFY_HOME"
+  # **绝不 rm -rf 数据目录本身**（AGENTS.md《操作安全规范》规则 1/4）。
+  #
+  # 本行原为 `rm -rf "$VERIFY_HOME"`，而 VERIFY_HOME 来自用户可传的
+  # LICORE_VERIFY_HOME —— 与 verify-security.sh 那次**删掉生产数据目录**
+  # 的事故是同一个写法。该事故后按新规范对全仓库自查时发现本脚本仍然
+  # 带着同一个洞，故一并修掉。
+  #
+  # 现在只删本脚本自己创建的容器（上面的 RUNNING 白名单）与 docker 对比
+  # 容器；数据目录原样保留。
+  if [ "$VERIFY_HOME_CREATED" = yes ]; then
+    info "数据目录 $VERIFY_HOME 是本脚本新建的，保留（如需清理请手动 rm -rf）"
+  else
+    info "数据目录 $VERIFY_HOME 是既有目录，未做任何删除（只删了本脚本创建的容器）"
+  fi
 }
 on_exit() {
   local rc=$?
@@ -219,8 +232,29 @@ else
 fi
 
 # 隔离目录：全新开始，避免上一轮残留影响判断。
-rm -rf "$VERIFY_HOME"
-mkdir -p "$VERIFY_HOME"
+#
+# **只在目录不存在时创建，绝不先删**（AGENTS.md《操作安全规范》规则 4）。
+# 原写法是 `rm -rf "$VERIFY_HOME"` 再 mkdir，等于"每次运行都先把用户指定的
+# 数据目录清空"——若 LICORE_VERIFY_HOME 指向真实数据目录，跑一次就毁一次。
+#
+# 需要干净环境时，请自己传一个全新的路径（如
+# `LICORE_VERIFY_HOME=/tmp/licore-cap-$(date +%s)`），而不是让脚本替你做删除。
+VERIFY_HOME_CREATED=no
+if [ ! -d "$VERIFY_HOME" ]; then
+  mkdir -p "$VERIFY_HOME" && VERIFY_HOME_CREATED=yes
+fi
+
+# 数据目录不在 /tmp 下时明确提示：脚本会往其中写测试容器。
+case "$VERIFY_HOME" in
+  /tmp/*) : ;;
+  *)
+    echo
+    echo "注意：LICORE_VERIFY_HOME=$VERIFY_HOME 不在 /tmp 下。"
+    echo "      脚本会在该数据目录内**创建测试容器**（$NAME_MAIN 等）。"
+    echo "      不会删除该目录或其中既有镜像/容器。"
+    echo
+    ;;
+esac
 info "隔离数据目录：$VERIFY_HOME"
 
 # ---------------------------------------------------------------------------

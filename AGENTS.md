@@ -287,6 +287,85 @@ licore shutdown       由系统服务停止时调用，优雅停止自启容器
 补充：即便只读验证，也要注意**不要碰非本次测试的资源**。本仓库的开发机同时
 跑着生产服务，验证时只操作自己创建的容器。
 
+## 操作安全规范（脚本删数据）
+
+**这一节是从一次真实数据损失事故里长出来的。先读事故记录，再读规则。**
+
+### 事故记录（v0.9.6，2026-10-05）
+
+安全审计的真机验证脚本 `scripts/verify-security.sh` 里，清理函数写的是：
+
+```bash
+cleanup_verify() {
+  ...
+  rm -rf "$VERIFY_HOME"     # ← 事故所在
+}
+```
+
+`VERIFY_HOME` 由用户可传的环境变量 `LICORE_VERIFY_HOME` 控制，默认值是
+`/tmp/licore-secverify-home`。为了验证网络项需要网段一致，该次以
+`LICORE_VERIFY_HOME=/root/.licore` 运行了一次 —— **脚本于是删掉了生产数据
+目录**，包括 `nginx:1.27-alpine`、`alpine:3.20.3-amd64`、
+`alpine:3.20.3-arm64`、`alpine:test` 四个镜像与一个既有容器 `swift_puma`。
+
+恢复情况：`alpine:3.20.3-amd64` 与 `alpine:3.20.3-arm64` 由
+`/root/licore-images` 下的原始 `.licore` 文件恢复（arm64 与原文件
+**字节一致**，经 sha256 比对）；`nginx:1.27-alpine` 用 `licore convert`
+从 docker 重建并验证可运行（`nginx/1.27.5`）；`alpine:test` 与容器
+`swift_puma` 无备份，**不可恢复**。详情见
+[docs/security-audit-v2.md](docs/security-audit-v2.md)。
+
+**性质**：这不是引擎缺陷，是脚本作者的操作失误。审计脚本被赋予了
+"删除用户数据"的能力，而它本不该有这种能力。
+
+### 四条硬性规则
+
+**1. 脚本里绝不出现 `rm -rf` 加变量。**
+
+```bash
+rm -rf "$VAR"                      # ✗ 禁止：$VAR 可能指向任何地方
+rm -rf /tmp/licore-verify-XXXXXX   # ✓ 允许：硬编码字符串，删的永远是这一个路径
+```
+
+删数据只能删**自己明确创建的路径**，且该路径必须以**字面量**出现在源码里。
+变量可以参与"判断"，不能参与"删除目标"。
+
+**2. 清理必须"白名单"而非"黑名单"。**
+
+只删自己创建的（把创建时拿到的 ID / 路径记进列表，循环删），**不是**
+"清掉整个数据目录再重建"。白名单的失效模式是"漏删，留下垃圾"；
+黑名单的失效模式是"多删，删掉用户的东西"。前者可接受，后者不可接受。
+
+```bash
+CREATED_CONTAINERS=(licore-verify-a licore-verify-b)
+for c in "${CREATED_CONTAINERS[@]}"; do
+  "$LICORE_BIN" rm -f "$c"      # 只删自己登记过的
+done
+```
+
+**3. 破坏性操作前必须打印要删什么，并停下等确认。**
+
+不能静默执行。至少要 `info "将删除：..."`，让日志里留下"它打算删什么"。
+有条件时应真的停下来等 `[y/N]`，默认（直接回车）视为拒绝。
+
+**4. 变量指向数据目录时（如 `LICORE_HOME` / `LICORE_VERIFY_HOME`），
+脚本绝不能碰。**
+
+数据目录属于用户。脚本可以在里面**创建**自己命名的子资源，但**永远不得
+删除目录本身**，也不得删除不是自己创建的镜像 / 容器 / 卷。
+数据目录不在 `/tmp` 下时应主动提示用户"我会往这里写东西"。
+
+### 自查方式
+
+提交任何带清理逻辑的脚本前：
+
+```bash
+grep -n 'rm -rf' scripts/*.sh
+# 逐条确认：删除目标是字面量吗？是脚本自己创建的吗？
+```
+
+---
+
 ## 禁止事项
 
 1. **禁止**引入任何第三方容器组件 / 容器库（Docker、containerd、runc、buildkit、OCI 相关库、cgroups 库等）——容器生态完全自研。
