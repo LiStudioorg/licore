@@ -472,12 +472,38 @@ func executeContainerCmd(cmdline, env []string) error {
 	if err := setNoNewPrivs(); err != nil {
 		return err
 	}
-	// 2. 能力裁剪：先清边界集再 capset。**这一步才是真正挡住危险操作的**
+	// 2. 能力裁剪 + 降权（--user）。**这一步才是真正挡住危险操作的**
 	//    （写 /proc/sysrq-trigger、加载 eBPF 都需要 CAP_SYS_ADMIN）；
 	//    no_new_privs 本身不丢能力，两者是互补关系。
-	kept, err := applyCapabilitiesFromEnv()
+	//
+	// 用 ApplyCapabilitiesSplit 把降权夹在"清边界集"与"capset"之间：
+	//  - PR_CAPBSET_DROP 需要 CAP_SETPCAP 在有效集里 → 必须在降权**之前**；
+	//  - setuid 到非 0 会清空 permitted/effective → capset 要在降权**之后**。
+	// 方向相反的两条约束只能这样满足。真机实测过的两种错序：
+	//  降权在前 → `prctl(PR_CAPBSET_DROP, 2): operation not permitted`
+	//  裁剪在前 → `设置 gid=1000 失败: operation not permitted`
+	// 两者都让容器 Exited(1)，且 `--cap-drop ALL --user 1000`（最该支持的组合）
+	// 必定失败。
+	//
+	// 只有当确实需要降权（--user 非空）时才走 split 版本：split 会在有效集里
+	// 临时保留 SETUID/SETGID 供降权使用，若没有降权需求就会白白多留两个能力
+	// （实测 `--cap-drop ALL` 会得到 CapEff=0xc0 而不是 0）。无降权需求时
+	// 走原路径，收口到纯最终集合。
+	drop, add := capsFromEnv(os.Environ())
+	var (
+		kept []string
+		err  error
+	)
+	if userFromEnv(os.Environ()) == "" {
+		kept, err = ApplyCapabilities(drop, add)
+	} else {
+		kept, err = ApplyCapabilitiesSplit(drop, add, applyUserSwitch)
+	}
 	if err != nil {
 		return fmt.Errorf("裁剪容器能力失败: %w", err)
+	}
+	if err := setNoNewPrivs(); err != nil {
+		return err
 	}
 	slog.Debug("容器能力已裁剪", slog.Any("kept", kept))
 	// 3. seccomp 黑名单：在能力裁剪之后再装。安装过滤器需要 no_new_privs
@@ -499,20 +525,18 @@ func executeContainerCmd(cmdline, env []string) error {
 	if err != nil {
 		return err
 	}
-	// 5. SELinux 的 attr/exec 只对本进程的**下一次** execve 生效，必须紧邻 execve。
-	inheritSELinuxContext()
-	// 6. 切换到用户指定的工作目录与身份（--workdir / --user）。
+	// 5. 切换工作目录（--workdir）。降权已在第 1.5 步完成。
 	//
-	// **必须排在能力裁剪之后、execve 之前**：
-	//  - 之后：setgid/setuid 需要能力，提前做会与 capset 的语义打架（且
-	//    --cap-drop ALL 之后连 setuid 都做不了，那就无法支持
-	//    "drop ALL + 非 root 用户"的合法组合）；
-	//  - 之前：晚了就来不及——execve 一旦发生，进程已经是用户命令了。
+	// 顺序说明：**先降权、后 chdir**。反过来会让 chdir 以目标用户身份执行，
+	// 而该用户可能对目标目录没有权限——但那正是用户显式指定的组合，
+	// 报错比悄悄换目录好。Docker 同样是先切用户再进目录。
 	//
-	// 与 exec 路径（RunExecSetup）保持同样的语义：那里也支持 --user/--workdir。
-	if err := applyWorkdirAndUser(); err != nil {
+	// 失败必须报错：静默忽略会让用户以为 --workdir 生效了，实际落在别的目录。
+	if err := applyWorkdir(); err != nil {
 		return err
 	}
+	// 5.5 SELinux 的 attr/exec 只对本进程的**下一次** execve 生效，必须紧邻 execve。
+	inheritSELinuxContext()
 	// 注意：execve 用解析后的路径，但 argv[0] 保持原样——
 	// 程序通过 argv[0] 看到的仍是用户写的命令名（与 shell 行为一致）。
 	if err := syscall.Exec(execPath, cmdline, env); err != nil {
@@ -521,24 +545,18 @@ func executeContainerCmd(cmdline, env []string) error {
 	return nil // 不可达
 }
 
-// applyWorkdirAndUser 应用 --workdir 与 --user（经 LICORE_WORKDIR / LICORE_USER
-// 下发）。两者都为空时是 no-op（保持历史行为：root 身份、根目录）。
+// applyUserSwitch 降权到 --user 指定的身份（经 LICORE_USER 下发）。
+// 未指定时是 no-op（保持 root 身份）。
 //
-// 顺序：先 chdir 再 setgid/setuid。反过来的话，chdir 就要以目标用户身份
-// 执行，而用户可能对目标目录没有权限——Docker 也是先切目录再降权的。
+// **必须在能力裁剪之前调用**：setgid/setuid 需要 CAP_SETGID / CAP_SETUID，
+// 裁剪之后再调用会 EPERM（真机实测：`--cap-drop ALL --user 1000` 报
+// `设置 gid=1000 失败: operation not permitted`，容器 Exited(1)）。
+// 先降权不影响隔离：no_new_privs 已设，之后仍会按规格裁剪能力。
 //
-// **失败必须报错，不许静默忽略**：静默忽略会让用户以为容器以 uid 1000 跑着，
-// 实际是 root——这正是"以为收紧了其实没有"的那类安全问题。
-func applyWorkdirAndUser() error {
-	env := os.Environ()
-
-	if wd := workdirFromEnv(env); wd != "" {
-		if err := os.Chdir(wd); err != nil {
-			return fmt.Errorf("切换工作目录到 %s 失败: %w", wd, err)
-		}
-	}
-
-	spec := userFromEnv(env)
+// 失败必须报错，不许静默忽略——静默忽略会让用户以为容器以 uid 1000 跑着，
+// 实际是 root，这正是"以为收紧了其实没有"的那类安全问题。
+func applyUserSwitch() error {
+	spec := userFromEnv(os.Environ())
 	if spec == "" {
 		return nil
 	}
@@ -558,6 +576,27 @@ func applyWorkdirAndUser() error {
 		return fmt.Errorf("设置 uid=%d 失败: %w", uid, err)
 	}
 	slog.Debug("容器以指定用户启动", "uid", uid, "gid", gid)
+	return nil
+}
+
+// applyWorkdir 切换容器 1 号进程的工作目录（经 LICORE_WORKDIR 下发）。
+// 未指定时是 no-op（保持根目录）。
+//
+// 单独成函数而不是与降权合并：两者的**位置要求不同**——降权必须在能力裁剪
+// 之前，而 chdir 要在容器 mount 视图完全就绪、且身份已确定之后。
+// 合在一起会逼着其中一个待在不该待的位置（本函数的前身
+// applyWorkdirAndUser 就因此把降权放在了裁剪之后，导致
+// `--cap-drop ALL --user 1000` 无法启动）。
+//
+// 失败必须报错：静默忽略会让用户以为 --workdir 生效了，实际落在别的目录。
+func applyWorkdir() error {
+	wd := workdirFromEnv(os.Environ())
+	if wd == "" {
+		return nil
+	}
+	if err := os.Chdir(wd); err != nil {
+		return fmt.Errorf("切换工作目录到 %s 失败: %w", wd, err)
+	}
 	return nil
 }
 

@@ -32,6 +32,7 @@ const helperArgv0Marker = "exec-setup"
 //
 // 收口规格经环境变量下发（LICORE_CAPS_DROP），与容器 init 一致。
 func RunExecSetup(argv []string) error {
+	var err error
 	// 约定：argv **含 argv[0]**（helper 自身路径），与真实进程的 os.Args 一致。
 	// CLI 子命令传入的是 cobra 的 args（不含 argv[0]），因此这里补一个占位，
 	// 让两条调用路径共用同一套解析。
@@ -47,10 +48,28 @@ func RunExecSetup(argv []string) error {
 	if err := setNoNewPrivs(); err != nil {
 		return err
 	}
-	// 2. capability 裁剪。**只减不加**——ExecSetupEnv 不接受 capsAdd，
-	//    因此这里永远只传 drop 列表，语义上不可能放宽。
+	// 2. capability 裁剪（**只减不加**——ExecSetupEnv 不接受 capsAdd，
+	//    因此这里永远只传 drop 列表，语义上不可能放宽）+ 可选的降权。
+	//
+	// 降权与裁剪的顺序**不可随意调换**，与容器 init 的
+	// ApplyCapabilitiesSplit 是同一组内核约束：
+	//
+	//	PR_CAPBSET_DROP 需要 CAP_SETPCAP 在有效集；
+	//	setuid 需要 CAP_SETUID/SETGID 在有效集，且降权会清空 permitted/effective。
+	//	→ 因此所有能力操作必须在降权**之前**做完，降权排在最后。
+	//
+	// 早先这里写成"先 applyExecUser 再 ApplyCapabilities"，真机实测直接
+	// 报 `prctl(PR_CAPBSET_DROP, 2): operation not permitted`
+	// （exec 一个 --user 1000 的容器时炸掉）。
+	//
+	// 无 --user 时走原路径，避免在有效集里多留 SETUID/SETGID。
 	drop := ExecSetupCapsDrop()
-	kept, err := ApplyCapabilities(drop, nil)
+	var kept []string
+	if userFromEnv(os.Environ()) == "" {
+		kept, err = ApplyCapabilities(drop, nil)
+	} else {
+		kept, err = ApplyCapabilitiesSplit(drop, nil, applyExecUser)
+	}
 	if err != nil {
 		return fmt.Errorf("exec-setup: 裁剪能力失败: %w", err)
 	}
@@ -69,23 +88,6 @@ func RunExecSetup(argv []string) error {
 	//
 	// 失败必须明确报错：静默忽略会让用户以为 -w 生效了，实际落在别的目录。
 	if err := chdirIfSet(workdir); err != nil {
-		return err
-	}
-
-	// 4.5 降权到目标用户（--user）。
-	//
-	// **必须排在能力裁剪与 seccomp 之后、execve 之前**：
-	//  - 裁剪要求调用者持有 CAP_SETPCAP（PR_CAPBSET_DROP 的硬性前提），
-	//    先降权就会报 `prctl(PR_CAPBSET_DROP, …): operation not permitted`
-	//    —— 真机实测：exec 一个 --user 1000 的容器时炸在这里；
-	//  - 而 execve 之后进程已经是用户命令，再改也来不及。
-	//
-	// 收口顺序因此是：no_new_privs → cap 裁剪 → seccomp → chdir → 降权 → execve。
-	// 与容器 init 的 applyWorkdirAndUser 语义一致（那里同样在裁剪之后降权）。
-	//
-	// 安全性：降权发生在收口之后，不会削弱隔离——no_new_privs 已设，
-	// 且能力已被裁剪，降权后的进程无法通过 execve 拿回任何特权。
-	if err := applyExecUser(); err != nil {
 		return err
 	}
 
