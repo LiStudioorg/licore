@@ -389,9 +389,13 @@ atoi("99999999999999999999") = 7766279631452241919   （溢出回绕）
 的可行性与兼容性——但那会破坏 `/proc/self/attr` 等合法写入，
 需谨慎评估，**不建议盲改**。
 
-### L-6（新发现，真机实测）网桥已存在时不校验网段，导致容器网络静默失效
+### ✅ L-6（已修复，commit `0a97664`）网桥已存在时不校验网段，导致容器网络静默失效
 
-**证据等级：✅ 真机实测复现（2026-10-05，本机 root）**
+**证据等级：✅ 真机实测复现 + 修复后 A/B 验证（2026-10-05 / 10-06，本机 root）**
+
+> **状态更新（2026-10-06）**：本条已于 `fix(network): verify bridge subnet on reuse,
+> fail on mismatch` 修复，并完成反向验证。原"未修"结论作废。
+> 修复要点与反向验证原始输出见文末《L-6 修复记录》一节。
 
 **现象**：在**全新的数据目录**里起容器，容器拿到 IP `172.21.0.2/16`、
 默认网关 `172.21.0.1`，但宿主上已存在的 `licore0` 网桥是 `172.22.0.1/16`
@@ -444,9 +448,11 @@ sudo LICORE_HOME=/tmp/新数据目录 licore exec t /bin/sh -c 'ip route; ping -
 # 复现：默认路由指向不存在的 172.21.0.1，ping 全部 100% loss
 ```
 
-**与本轮其他工作的关系**：`--mirror` 安装功能（`7f4462e`）与 L-1 文档化
-（`3351bde`）均**不受此缺陷影响**；L-6 是独立发现，**未修**，
-登记在此与 `docs/known-limitations.md` 待后续处理。
+**修复（2026-10-06，`0a97664`）**：`ensurePreset` 改为**采用既有网桥的真实网段**
+（根因——`pickFreeSubnet` 会跳过 licore0 自己的路由，因此看不见既有网桥占的
+网段）；`driverBootstrap` 复用前校验网段，不匹配则报
+`ErrBridgeSubnetMismatch`；engine 把该错误**致命化**（不再降级为 WARN）。
+反向验证与真机 A/B 见文末《L-6 修复记录》。
 
 
 ---
@@ -1255,3 +1261,136 @@ sudo bash scripts/verify-security.sh --json          # 只输出机器可读结�
 ---
 
 *修复部分完成于 v0.9.6。反向验证输出为真实执行结果，未做任何修饰。*
+
+---
+
+# L-6 修复记录与反向验证（2026-10-06）
+
+修复 commit：`0a97664` — `fix(network): verify bridge subnet on reuse, fail on mismatch`
+
+## 修复了哪几处
+
+排查发现**根因不在报错的那一行**，而是三处叠加：
+
+| # | 位置 | 问题 | 改法 |
+| --- | --- | --- | --- |
+| 1 | `Manager.ensurePreset` | 无条件 `pickFreeSubnet`；而它**显式跳过 licore0 自己的路由**（`subnetRoutedByOther` 里 `iface == PresetBridgeName → continue`，本意是"别被自己绊倒"），于是看不见既有网桥占的 172.22，选出 172.21 | **优先采用既有网桥的真实网段**（网桥是事实来源），没有才自行挑选 |
+| 2 | `driverBootstrap` | 见同名网桥直接 `return nil`，不校验地址 | 复用前调 `checkBridgeSubnet`；不匹配返回 `ErrBridgeSubnetMismatch` |
+| 3 | `engine.wireNetworkBeforeStart` | 把所有 `EnsureDriver` 失败降级为 WARN（为"非 root 跑"的既定语义） | `ErrBridgeSubnetMismatch` **致命**——它不是权限问题 |
+
+新增 `netlink.ListAddrs`（RTM_GETADDR）与 `existingBridgeSubnet`。
+**`ListAddrs` 必须带 `NLM_F_DUMP`**：不带时内核回 EOPNOTSUPP，
+真机实测在 `lo` / `licore0` / `docker0` 上全报
+`rtnetlink get-addr: operation not supported`。
+
+判据是"网桥上**存在一个**与本网络 Gateway + Subnet 完全吻合的地址"，
+不是"只有它一个"——网桥挂多地址是合法用法。网关必须真的在网桥上，
+因为它是容器默认路由的下一跳；只比网段会漏掉"网段对但网关错"。
+
+## 反向验证
+
+### 第 1 轮：回退 `driverBootstrap` 的校验接线
+
+**第一次反向验证暴露了测试假阴性——这是本轮最重要的发现。**
+
+把接线改回 `return nil` 后，**全部 8 个 `checkBridgeSubnet` 用例仍然通过**：
+
+```
+--- PASS: TestCheckBridgeSubnetAcceptsMatchingGateway
+--- PASS: TestCheckBridgeSubnetRejectsMismatch        ← 审的正是这个场景，却绿了
+--- PASS: TestCheckBridgeSubnetRejectsNoAddrs
+...（共 8 条全绿）
+ok  	github.com/LiStudioorg/licore/internal/network
+```
+
+原因：这些用例是**直接调用 `checkBridgeSubnet` helper**，绕过了
+`driverBootstrap` 这个真正的调用点。**helper 正确 ≠ 接线正确。**
+
+补了经 `driverBootstrap` 进入的端到端用例（并为此把 `linkByNameFn`
+抽成可注入变量）后重跑，判别力才出现：
+
+```
+--- FAIL: TestDriverBootstrapRejectsMismatchedExistingBridge (0.00s)
+    driver_bridge_subnet_test.go:280: !!! 漏洞复现：driverBootstrap 复用了网段不匹配的既有网桥
+--- PASS: TestDriverBootstrapAcceptsMatchingExistingBridge (0.00s)
+FAIL	github.com/LiStudioorg/licore/internal/network	0.036s
+```
+
+恢复修复后：
+
+```
+ok  	github.com/LiStudioorg/licore/internal/network	0.010s
+```
+
+### 第 2 轮：回退 `ensurePreset` 的"采用既有网段"
+
+精确复现了原始缺陷（注意这正是真机上看到的那两个数字）：
+
+```
+    driver_bridge_subnet_test.go:177: 应采用既有网桥网段 172.22.0.0/16，实际 172.21.0.0/16（容器会因网关不存在而无网）
+    driver_bridge_subnet_test.go:180: 应采用既有网桥网关 172.22.0.1，实际 172.21.0.1
+--- FAIL: TestEnsurePresetAdoptsExistingBridgeSubnet (0.00s)
+--- PASS: TestEnsurePresetPicksSubnetWhenNoBridge (0.00s)     ← 反向约束仍绿
+--- FAIL: TestEnsurePresetThenBootstrapPasses (0.00s)
+```
+
+### 第 3 轮：真机 A/B（同一台 45.207.198.91，同一错配场景）
+
+构造：新数据目录 + `licore0.json` 写 172.21，宿主网桥实际 172.22.0.1/16。
+
+**漏洞版本**（`run` 静默成功）：
+
+```
+容器 l6vuln（879c0c561ede）已在后台运行，shim 持有生命周期
+退出码=0
+
+容器内 ip route : default via 172.21.0.1 dev vpe879c0c5     ← 网关不存在
+容器内 ping 172.22.0.1（真实网关）: 100% packet loss
+容器内 ping 8.8.8.8               : 100% packet loss
+```
+
+**修复版本**（`run` 明确失败，不留容器）：
+
+```
+licore: 接入网络 licore0 失败: 网桥 licore0 已存在，但其地址 172.22.0.1/16
+与本网络定义（网关 172.21.0.1，网段 172.21.0.0/16）不一致；拒绝复用以避免
+容器起来后无网络：licore/network: 同名网桥的网段与本网络定义不一致，拒绝复用。
+处置：改用创建该网桥时的数据目录（LICORE_HOME），或先删除该网桥
+（licore network rm licore0）再重试
+退出码=1
+```
+
+### 正常路径回归（不能误伤）
+
+新数据目录在没有既有网桥时**自动采用**了网桥的真实网段，容器网络正常：
+
+```
+/root/.licore 与全新数据目录下的容器：
+  default via 172.22.0.1 dev vpeXXXX
+  ping 网关   : 0% packet loss
+  ping 8.8.8.8: 0% packet loss
+```
+
+## 门禁
+
+```
+gofmt -l .            : 空
+go vet ./...          : 零告警
+go test ./...         : 19 包全绿
+交叉编译              : linux{amd64,arm64,arm,386,riscv64} + android/arm64
+                        + darwin{arm64,amd64} —— 8/8 通过
+```
+
+> darwin 曾因 `existingBridgeSubnet` 放在**无 build tag** 的 `manager.go`
+> 里而与 `driver_nonlinux.go` 的 stub 重复定义，交叉编译才暴露出来
+> （`redeclared in this block`）。已移到 `driver_linux.go`。
+
+## 排查中顺带修复的真机数据
+
+`/root/.licore/networks/licore0.json` 被此前的隔离数据目录运行**覆写**成了
+172.21，而宿主网桥自始至终是 `172.22.0.1/16`（L-1 文档里记录的容器 IP
+`172.22.0.3` 可佐证）。已按网桥真实地址修正，生产容器网络随即恢复
+（ping 网关与外网均通）。
+
+这也说明 L-6 的危害不止"新目录起容器无网"：**被覆写的定义会让原本正常的
+数据目录也变得不可用**——只是修复前表现为静默无网，修复后表现为明确报错。
