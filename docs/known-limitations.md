@@ -129,6 +129,143 @@ licore stop web && licore rm web
 
 ---
 
+## L-4 传 `--user` 时容器**边界集**里保留 `CAP_SETPCAP`/`CAP_SETUID`/`CAP_SETGID`
+
+**状态**：已知，**有意保留**（v0.9.8 起记录；2026-10-06 真机实测确认不可兑现）
+
+### 现象
+
+只传 `--cap-drop` 时，容器 PID 1 的**边界集**精确等于最终集合：
+
+| 参数 | CapEff | CapBnd |
+| --- | --- | --- |
+| `--cap-drop ALL` | `0000000000000000` | `0000000000000000` |
+
+但一旦**同时**传 `--user`，边界集就会多留三个能力：
+
+| 参数 | CapEff | CapBnd |
+| --- | --- | --- |
+| `--user 1000:1000` | `0000000000000000` | `00000000a80425fb` |
+| `--cap-drop ALL --user 1000:1000` | `0000000000000000` | `00000000000001c0` |
+| `--cap-drop SETGID,SETUID --user 1000:1000` | `0000000000000000` | `00000000a80425fb` |
+
+`0x1c0` = bit6 `SETGID` | bit7 `SETUID` | bit8 `SETPCAP`。
+`0xa80425fb` 是默认 14 项再加上这三个。
+
+注意 **`CapEff` 始终是 `0`** —— 有效集没有任何能力。这与"边界集残留"
+是两件事，也是最容易看错的地方。
+
+### 原因
+
+这是"降权 + 裁剪能力"同时要求下**唯一可行顺序**的必然产物。
+
+内核有五条方向互斥的约束（`internal/runtime/capability_linux.go` 有完整推导）：
+
+- `PR_CAPBSET_DROP` 需要 `CAP_SETPCAP` 在**有效集**里；
+- 从**边界集**移除某能力时，内核同时把它从 permitted/effective 清掉；
+- `capset` 收紧**非空**集合同样需要 `CAP_SETPCAP` 在有效集里；
+- `setuid/setgid` 到非 0 需要 `CAP_SETUID`/`CAP_SETGID` 在有效集里；
+- **降权成功会清空 permitted/effective** → 降权必须是最后一步能力操作。
+
+由前三条可得：`CAP_SETPCAP` 一旦离开边界集，之后**任何** `capset` 与
+`PR_CAPBSET_DROP` 都 EPERM。而移除 `CAP_SETPCAP` 自身这一步又必须在
+"用它清完其它能力"之后 —— **死锁**。解法是：清边界集时**把 `CAP_SETPCAP`
+一起留着**，只把它从**有效集**摘掉。
+
+`SETUID`/`SETGID` 同理：降权需要它们有效，而降权是最后一步，
+所以它们必须在边界集里活到最后。
+
+**五个错序全部真机实测过，容器一律 `Exited(1)`**：
+
+```
+先降权再裁剪        -> prctl(PR_CAPBSET_DROP, 2): operation not permitted
+先裁剪再降权        -> 设置 gid=1000 失败: operation not permitted
+清边界集后 capset    -> capset: operation not permitted
+capset 后清边界集    -> prctl(PR_CAPBSET_DROP, 0): operation not permitted
+降权后再收口        -> 清边界集(最终): operation not permitted
+```
+
+### 影响面：已实测确认**不可兑现**
+
+边界集只是"execve 时**最多**能获得哪些能力"的**上限**，它本身**不授予**
+任何能力。要把它兑现成真实特权只有两条路，**两条都堵死**。
+
+**路径一：经 execve 提权**（file capability / setuid-root 程序）。
+容器已设 `no_new_privs=1`，内核在 execve 时**不赋予任何新特权**。
+
+真机验证（`--cap-drop ALL --user 1000:1000` 容器内）：
+
+```
+CapInh: 00000000000000c0     <- 继承集里确实有 SETUID|SETGID
+CapPrm: 0000000000000000     <- 但 permitted 为空
+CapEff: 0000000000000000     <- effective 也为空
+CapBnd: 00000000000001c0     <- 边界集残留
+CapAmb: 0000000000000000
+NoNewPrivs: 1
+```
+
+且容器内**没有任何可兑现它的东西**：
+
+```bash
+find / -xdev -type f -perm -4000      # 无 setuid 程序
+/bin/busybox id                        # uid=1000 gid=1000 —— 没拿回 root
+```
+
+**路径二：直接调 `capset` 改自己的能力集**（不需要 execve —— 这是
+`CAP_SETPCAP` 比 `SETUID`/`SETGID` 更值得单独说明的地方）。
+但 `capset` 收紧非空集合需要 `CAP_SETPCAP` 在**有效集**里，
+而收口第 3 步（`capset(keep ∪ {SETUID,SETGID})`）已把它从有效集摘掉，
+此后 permitted 与 inheritable 均为空，子进程也继承不到。
+
+两条路都不可达，故残留**不构成提权面**。
+
+### 为什么不干脆清干净
+
+因为**清不掉**：降权之后内核清空了 permitted/effective，`PR_CAPBSET_DROP`
+必然 EPERM（约束 5）。想清就必须把降权放到清边界集之前，而那会让
+`setuid` 因缺 `CAP_SETUID` 失败（约束 4）—— 这正是上面五条错序里的两种。
+
+### 修复方向
+
+**没有干净的修复方向**，除非改变隔离模型本身：
+
+1. **引入 `CLONE_NEWUSER`**：容器 root 映射为非 root，`setuid` 语义改变，
+   不再需要 `CAP_SETUID`。但这正是本项目**有意不做**的（root 下运行时不加
+   `CLONE_NEWUSER`，加了会失去挂载能力）。属架构级取舍，不是缺陷修复。
+2. **降权改由父进程在 fork 后、exec 前完成**：需要引擎侧多一层配合，
+   且要保证降权发生在收口之后。成本高，收益仅是"边界集更干净"，
+   而残留已证明不可兑现。
+
+**结论：保持现状。** 这条记录的目的是让审计者看到 `CapBnd` 非零时
+**不要直接判为漏洞** —— 需结合 `CapEff`/`CapPrm`/`NoNewPrivs` 一起看。
+
+### 验证用例
+
+```bash
+# 1. 边界集残留确实存在（读容器 PID 1，不是 exec 进程）
+licore run -d --name setpcap --cap-drop ALL --user 1000:1000 \
+  alpine:3.20.3-amd64 /bin/busybox sleep 300
+P=$(sudo python3 -c "import json;print(json.load(open('/root/.licore/containers/$(licore ps -q | head -1)/runtime.json'))['initPid'])")
+sudo grep -E 'Cap|Uid|NoNewPrivs' /proc/$P/status
+#   期望 CapBnd=00000000000001c0、CapEff=0000000000000000、NoNewPrivs=1
+
+# 2. 残留不可兑现：容器内拿不回特权
+licore exec setpcap /bin/busybox id                                  # 期望 uid=1000 gid=1000
+licore exec setpcap /bin/sh -c 'find / -xdev -type f -perm -4000'    # 期望空
+
+# 3. exec 进程同样不能兑现（exec 走独立的收口路径）
+licore exec setpcap /bin/sh -c 'grep -E "Cap(Prm|Eff|Bnd)" /proc/self/status'
+
+licore stop setpcap && licore rm setpcap
+```
+
+### 优先级
+
+**不修**（有意保留）。若未来审计要求"边界集必须精确等于最终集合"，
+需先推翻"root 下不加 `CLONE_NEWUSER`"的架构决定，属 RFC 级议题。
+
+---
+
 ## L-2 容器 DNS 依赖宿主可用的上游
 
 **状态**：设计如此，非缺陷（记录以便排查）
