@@ -306,3 +306,31 @@ config.json 也存对了，但没有下发到 init）。于是把所有参数按
 
 exec 侧 `继承 / 显式覆盖 / 指定他人` 三种用法均正确
 （`uid=1000 gid=1000 pwd=/tmp` / `uid=0 pwd=/` / `uid=1001 gid=1002`）。
+
+### 全 flag 生效审计（v0.9.9，2026-10-06，真机 45.207.198.91 root）
+
+覆盖面扩展到 `run` 之外：`exec` / `build` / `volume` / `network` / `compose`
+的命令与 flag 全部按"解析 → 传递 → 生效"三段验证，判据仍取容器内真实状态。
+完整表格、逐条判据与未验证项见 [docs/flag-audit.md](flag-audit.md)。
+
+本轮新发现并修复 2 类缺陷（各 1 个 commit）：
+
+1. **cgroup 控制器未逐个启用 → 资源限制整类静默失效**（`930df16`）。
+   宿主 root 的 `subtree_control` 未 delegate `cpuset`/`io` 时，
+   一次写 `+cpu +memory +pids +cpuset` 因 cpuset 不可用而**整条**失败，
+   `--memory`/`--cpus`/`--pids-limit` 全部失效且容器照常 Up
+   （`memory.max` 文件根本不存在）。`controllers` 另漏 `io`，`--blkio-weight` 同样失效。
+   现改为逐个写 + 只对"已请求且依赖控制器不可用"报错，`engine.Run` 拒绝以无限制方式启动。
+2. **`compose scale` 恒失败 / `replicas` 被忽略**（`62a5c5d`）。
+   `startService` 名字不含副本序号，所有副本撞同名；`compose up` 未读 `Replicas`。
+
+**据此从本清单移除**（本轮已在真机验证生效）：
+`--memory-reservation`（落到 `memory.low`）、`--blkio-weight`（`io.weight`）、
+`--entrypoint`、`-v` 命名卷与 `:ro`、`-p` 端口映射（nft DNAT + 端到端可达）、
+`--network none/host/自定义`、`--ip`、`--restart` 四策略、
+exec 的 `-e/-w/-u/-i/-t/--cap-drop/--cap-add(拒绝)/cgroup 归置`、
+`build` 的 `--arch/--os/--tag/--context/--no-cache/--slim`。
+
+**仍未验证**：`--storage` 配额实际生效（需 XFS project quota）、
+`--network-bandwidth`/`--gpu`/`--npu`（功能未实现，CLI 显式拒绝）、
+cgroup v1 路径下的资源项、macOS/Android 平台项。
