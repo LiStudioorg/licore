@@ -538,7 +538,9 @@ func TestEnableControllersCreatesParentGroup(t *testing.T) {
 func TestEnableControllersIdempotent(t *testing.T) {
 	root := t.TempDir()
 	withV2GroupRoot(t, root)
-	if err := os.WriteFile(filepath.Join(root, "cgroup.controllers"), []byte("cpu memory pids\n"), 0o644); err != nil {
+	// 用 controllers 常量派生可用控制器列表，而不是硬编码 ——
+	// 否则常量一变（如补上 cpuset）这条幂等用例就会假失败。
+	if err := os.WriteFile(filepath.Join(root, "cgroup.controllers"), []byte(controllers+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	for i := range 3 {
@@ -548,7 +550,17 @@ func TestEnableControllersIdempotent(t *testing.T) {
 	}
 	got := readTestFile(t, filepath.Join(root, LiCoreGroup, "cgroup.subtree_control"))
 	// 已启用后不应再写（内容保持首次写入的结果）。
-	if strings.Count(got, "+cpu") != 1 {
-		t.Errorf("+cpu 应恰好出现一次: %q", got)
+	//
+	// 必须按**空格切分后的完整 token** 计数，不能对整串做子串计数：
+	// "+cpu" 是 "+cpuset" 的子串，子串计数会把 cpuset 误算成 cpu 的第二次出现
+	// （本次给 controllers 补 cpuset 时就被这条绊了一下）。
+	counts := map[string]int{}
+	for _, f := range strings.Fields(got) {
+		counts[f]++
+	}
+	for _, c := range strings.Fields(controllers) {
+		if counts["+"+c] != 1 {
+			t.Errorf("+%s 应恰好出现一次，实得 %d 次: %q", c, counts["+"+c], got)
+		}
 	}
 }

@@ -256,15 +256,17 @@ func TestV2EnableControllersIdempotentWithIO(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 预置已开启全部需要的控制器 → enableControllers 应无事可做（不重复写）。
+	// 期望值由 controllers 常量派生：常量新增控制器时本用例自动跟上，
+	// 不需要（也不应该）手工同步硬编码列表。
 	if err := os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"),
-		[]byte("cpu memory pids\n"), 0o644); err != nil {
+		[]byte(controllers+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := enableControllers(); err != nil {
 		t.Fatal(err)
 	}
-	if got := readFake(t, filepath.Join(parent, "cgroup.subtree_control")); got != "cpu memory pids" {
-		t.Fatalf("幂等失败: %q", got)
+	if got := readFake(t, filepath.Join(parent, "cgroup.subtree_control")); got != controllers {
+		t.Fatalf("幂等失败: %q（期望 %q）", got, controllers)
 	}
 }
 
