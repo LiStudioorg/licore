@@ -497,9 +497,27 @@ CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o licore-darwin-arm64 .
    提前收口会让容器直接启动失败；晚于 `execve` 则用户命令带着完整能力跑。
    这是 init 交出控制权前的唯一正确收口点。
 
-2. **capability 裁剪的顺序不可交换：先清边界集，再 `capset`。**
-   `PR_CAPBSET_DROP` 要求有效集里有 `CAP_SETPCAP`；先 `capset` 把集合降下来
-   之后就再也清不动边界集，剩余能力会留给子进程 exec 重新获得。
+2. **capability 裁剪与降权的顺序不可交换，且必须经
+   `ApplyCapabilitiesSplit` 完成。**
+   内核有五个方向互斥的约束（`internal/runtime/capability_linux.go` 有完整推导）：
+
+   - `PR_CAPBSET_DROP` 需要 `CAP_SETPCAP` 在**有效集**里；
+   - 从**边界集**移除某能力时，内核同时把它从 permitted/effective 清掉
+     —— 所以 `CAP_SETPCAP` 一旦离开边界集，之后**任何** `capset` 都 EPERM；
+   - `capset` 收紧**非空**集合同样需要 `CAP_SETPCAP` 在有效集里；
+   - `setuid/setgid` 到非 0 需要 `CAP_SETUID`/`CAP_SETGID` 在有效集里；
+   - 降权成功会清空 permitted/effective —— **降权必须是最后一步能力操作**。
+
+   前三条构成死锁，解法是**把 `CAP_SETPCAP` 留在边界集里**（它只影响
+   execve 能获得什么，而 `no_new_privs=1` 让 execve 不给任何新特权），
+   但必须从**有效集**摘掉它。顺序：`capset(中间态)` → 清边界集 →
+   `capset(收口态，无 SETPCAP)` → 降权。
+
+   **五条错序都在真机上把容器打成 `Exited(1)`**，从错误信息可以反查：
+   报 `PR_CAPBSET_DROP` 说明降权早了或 `capset` 先摘了 `SETPCAP`；
+   报 `设置 gid=…失败` 说明裁剪早了；报 `capset` 说明边界集先清了。
+   改动这段前后务必跑 `scripts/verify-capabilities.sh`
+   并覆盖 `--cap-drop ALL --user 1000:1000` 组合。
 
 3. **seccomp 的带参数规则必须排在所有无条件规则之后。**
    带参数规则会重新加载 `args[0]`，冲掉累加器里的 `nr`；若其后还有 `JEQ nr`
@@ -533,7 +551,12 @@ nsenter ... -m -u -i -n -p -- /.licore/exec-helper exec-setup [--workdir <dir>] 
 ```
 
 helper（`runtime.RunExecSetup`）按**与容器 init 相同**的顺序收口后再 execve：
-no_new_privs → capability 裁剪 → seccomp。
+no_new_privs → capability 裁剪（必要时含降权）→ seccomp → chdir → execve。
+
+`--user` / `--workdir` 的降权与切目录**不再由 `nsenter` 的 `-S/-G` 承担**：
+`-S/-G` 是在 setns 之后、**执行 helper 之前**降权，导致 helper 做能力裁剪时
+`PR_CAPBSET_DROP` 直接 `EPERM`（真机实测）。现改由 helper 在完成全部收口后
+自己降权，与容器 init 走同一个 `ApplyCapabilitiesSplit`。
 
 约束：
 
