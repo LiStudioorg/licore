@@ -152,3 +152,52 @@ func TestStartEnvKeepsOtherAssemblyParams(t *testing.T) {
 		t.Errorf("LICORE_CGROUP_ID 应下发为容器 ID，实得 %q ok=%v", v, ok)
 	}
 }
+
+// --workdir / --user 同样必须下发（与 --cap-* 同源缺陷：CLI 解析了、
+// config.json 存了，但没传到 init）。
+func TestStartEnvCarriesWorkdirAndUser(t *testing.T) {
+	cases := []struct {
+		name        string
+		workdir     string
+		user        string
+		wantWorkdir string
+		wantUser    string
+	}{
+		{"都不传", "", "", "", ""},
+		{"只 workdir", "/srv/app", "", "/srv/app", ""},
+		{"只 user", "", "1000:1000", "", "1000:1000"},
+		{"只 user（无 gid）", "", "1000", "", "1000"},
+		{"两者都传", "/srv/app", "1000:2000", "/srv/app", "1000:2000"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			env := captureStartEnv(t, &store.ContainerConfig{
+				ConfigVersion: 1, ID: "wd1234567890", Name: "wd", ImageRef: "x:v1",
+				Rootfs: "/tmp/x", Restart: store.RestartNo, Cmd: []string{"/x"},
+				WorkingDir: c.workdir, User: c.user,
+			})
+
+			gotWd, hasWd := envValue(env, "LICORE_WORKDIR")
+			if c.wantWorkdir == "" {
+				if hasWd {
+					t.Errorf("不该出现 LICORE_WORKDIR，却得到 %q", gotWd)
+				}
+			} else if !hasWd {
+				t.Errorf("LICORE_WORKDIR 未下发！--workdir %s 会在容器上静默失效", c.workdir)
+			} else if gotWd != c.wantWorkdir {
+				t.Errorf("LICORE_WORKDIR = %q，期望 %q", gotWd, c.wantWorkdir)
+			}
+
+			gotU, hasU := envValue(env, "LICORE_USER")
+			if c.wantUser == "" {
+				if hasU {
+					t.Errorf("不该出现 LICORE_USER，却得到 %q", gotU)
+				}
+			} else if !hasU {
+				t.Errorf("LICORE_USER 未下发！--user %s 会在容器上静默失效", c.user)
+			} else if gotU != c.wantUser {
+				t.Errorf("LICORE_USER = %q，期望 %q", gotU, c.wantUser)
+			}
+		})
+	}
+}

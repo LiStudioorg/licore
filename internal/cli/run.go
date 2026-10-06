@@ -174,7 +174,7 @@ func newRunCommand(out io.Writer) *cobra.Command {
 	f.IntVar(&opts.npu, "npu", 0, "直通 NPU 设备数（0=不直通）")
 	f.StringArrayVarP(&opts.env, "env", "e", nil, "环境变量 KEY=VALUE，可重复")
 	f.StringVar(&opts.workdir, "workdir", "", "工作目录")
-	f.StringVar(&opts.user, "user", "", "运行用户 uid:gid（阶段 3 生效）")
+	f.StringVar(&opts.user, "user", "", "运行用户 uid[:gid]（省略 gid 时跟随 uid；仅支持数字，不支持用户名）")
 	f.StringSliceVar(&opts.entrypoint, "entrypoint", nil, "覆盖镜像 entrypoint")
 	f.StringSliceVarP(&opts.ports, "publish", "p", nil, "端口映射 HOST:CONTAINER[:PROTO]")
 	f.StringSliceVarP(&opts.volumes, "volume", "v", nil, "卷挂载 SRC:TARGET[:ro]；SRC 可为宿主路径或命名卷，省略=匿名卷")

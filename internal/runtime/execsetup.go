@@ -52,6 +52,15 @@ func IsExecSetupProcess() bool { return os.Getenv(envExecSetup) == "1" }
 // 刻意**没有** capsAdd 参数：exec 不允许放宽能力。若允许
 // `licore exec --cap-add SYS_ADMIN`，这套隔离就完全可绕过。
 func ExecSetupEnv(capsDrop, extraDrop []string) []string {
+	return ExecSetupEnvUser(capsDrop, extraDrop, "")
+}
+
+// ExecSetupEnvUser 在 ExecSetupEnv 基础上追加 exec 的目标用户。
+//
+// user 为 "uid[:gid]"；为空表示不切换身份（沿用调用者，通常是 root）。
+// 单独出一个函数而不是改 ExecSetupEnv 签名：后者已被现有调用与测试使用，
+// 新增参数会波及冻结接口的登记面。
+func ExecSetupEnvUser(capsDrop, extraDrop []string, user string) []string {
 	merged := make([]string, 0, len(capsDrop)+len(extraDrop))
 	merged = append(merged, capsDrop...)
 	merged = append(merged, extraDrop...)
@@ -59,6 +68,9 @@ func ExecSetupEnv(capsDrop, extraDrop []string) []string {
 	out := []string{envExecSetup + "=1"}
 	if len(merged) > 0 {
 		out = append(out, envCapsDrop+"="+strings.Join(merged, ","))
+	}
+	if strings.TrimSpace(user) != "" {
+		out = append(out, envUser+"="+user)
 	}
 	return out
 }

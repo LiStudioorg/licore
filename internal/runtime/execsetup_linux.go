@@ -72,6 +72,23 @@ func RunExecSetup(argv []string) error {
 		return err
 	}
 
+	// 4.5 降权到目标用户（--user）。
+	//
+	// **必须排在能力裁剪与 seccomp 之后、execve 之前**：
+	//  - 裁剪要求调用者持有 CAP_SETPCAP（PR_CAPBSET_DROP 的硬性前提），
+	//    先降权就会报 `prctl(PR_CAPBSET_DROP, …): operation not permitted`
+	//    —— 真机实测：exec 一个 --user 1000 的容器时炸在这里；
+	//  - 而 execve 之后进程已经是用户命令，再改也来不及。
+	//
+	// 收口顺序因此是：no_new_privs → cap 裁剪 → seccomp → chdir → 降权 → execve。
+	// 与容器 init 的 applyWorkdirAndUser 语义一致（那里同样在裁剪之后降权）。
+	//
+	// 安全性：降权发生在收口之后，不会削弱隔离——no_new_privs 已设，
+	// 且能力已被裁剪，降权后的进程无法通过 execve 拿回任何特权。
+	if err := applyExecUser(); err != nil {
+		return err
+	}
+
 	// 5. execve 用户命令。路径在容器视图内解析（此时已在容器的 mount ns 里）。
 	env := envWithoutLiCore()
 	if err := syscall.Exec(cmd[0], cmd, env); err != nil {
@@ -142,5 +159,35 @@ func chdirIfSet(workdir string) error {
 	if err := os.Chdir(workdir); err != nil {
 		return fmt.Errorf("exec-setup: 切换工作目录到 %q 失败: %w", workdir, err)
 	}
+	return nil
+}
+
+// applyExecUser 应用 exec 的目标用户（LICORE_USER）。
+//
+// 从**环境变量**而不是 argv 读取：argv 要原样透传给用户命令，往里塞
+// 引擎自己的参数会污染用户命令。这也与 LICORE_CAPS_DROP 的下发方式一致。
+//
+// 空值 = 不改身份（保持调用者身份）。失败必须报错——静默忽略会让用户
+// 以为"以 uid 1000 跑了"，实际是 root。
+func applyExecUser() error {
+	spec := userFromEnv(os.Environ())
+	if spec == "" {
+		return nil
+	}
+	uid, gid, err := ParseUserSpec(spec)
+	if err != nil {
+		return fmt.Errorf("exec-setup: 解析 --user %q 失败: %w", spec, err)
+	}
+	// 先 gid 后 uid：setuid 之后不再持有 CAP_SETGID。
+	if err := syscall.Setgroups([]int{gid}); err != nil {
+		slog.Debug("exec-setup: 设置附加组失败（忽略）", "gid", gid, "err", err)
+	}
+	if err := syscall.Setgid(gid); err != nil {
+		return fmt.Errorf("exec-setup: 设置 gid=%d 失败: %w", gid, err)
+	}
+	if err := syscall.Setuid(uid); err != nil {
+		return fmt.Errorf("exec-setup: 设置 uid=%d 失败: %w", uid, err)
+	}
+	slog.Debug("exec-setup: 已切换用户", "uid", uid, "gid", gid)
 	return nil
 }

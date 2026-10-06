@@ -130,13 +130,20 @@ func Enter(targetPID int, workdir, user string, env []string, inFd, outFd, errFd
 	if err != nil {
 		return -1, err
 	}
-	// uid/gid 交给 nsenter 的 -S/-G：两者（util-linux 与 busybox）短选项
-	// 写法完全一致，且是在**进入命名空间之后**才设置，语义正确。
-	// 由 Go 侧先 setuid 再 exec nsenter 是行不通的——降权后就没权限 setns 了。
-	if uid, gid, ok, err := parseExecUser(user); err != nil {
+	// **不再用 nsenter 的 -S/-G 做降权**（虽然两个实现的短选项写法一致）。
+	//
+	// 原因：-S/-G 在 setns 之后、**执行 helper 之前**就降权，于是容器内的
+	// helper 是以目标 uid 运行的 —— 而 helper 要做 capability 裁剪
+	// （PR_CAPBSET_DROP 需要 CAP_SETPCAP），非 root 身份下直接
+	// `operation not permitted`（真机实测）。表现为
+	// `licore exec -u 1000 ...` 报"裁剪能力失败"。
+	//
+	// 改为把 uid/gid 经环境变量交给 helper，由 helper 在**完成全部收口之后、
+	// execve 用户命令之前**降权，与容器 init 的顺序一致。
+	// user 参数保留在签名里（冻结接口），供 helper 侧的 env 构造使用；
+	// 这里只做格式校验，不产生 nsenter 参数。
+	if _, _, _, err := parseExecUser(user); err != nil {
 		return -1, err
-	} else if ok {
-		argv = insertUserFlags(argv, prog, uid, gid)
 	}
 
 	// #nosec G204：argv 由本函数按固定模板构造，目标命令来自用户显式指定的

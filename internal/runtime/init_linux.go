@@ -501,12 +501,64 @@ func executeContainerCmd(cmdline, env []string) error {
 	}
 	// 5. SELinux 的 attr/exec 只对本进程的**下一次** execve 生效，必须紧邻 execve。
 	inheritSELinuxContext()
+	// 6. 切换到用户指定的工作目录与身份（--workdir / --user）。
+	//
+	// **必须排在能力裁剪之后、execve 之前**：
+	//  - 之后：setgid/setuid 需要能力，提前做会与 capset 的语义打架（且
+	//    --cap-drop ALL 之后连 setuid 都做不了，那就无法支持
+	//    "drop ALL + 非 root 用户"的合法组合）；
+	//  - 之前：晚了就来不及——execve 一旦发生，进程已经是用户命令了。
+	//
+	// 与 exec 路径（RunExecSetup）保持同样的语义：那里也支持 --user/--workdir。
+	if err := applyWorkdirAndUser(); err != nil {
+		return err
+	}
 	// 注意：execve 用解析后的路径，但 argv[0] 保持原样——
 	// 程序通过 argv[0] 看到的仍是用户写的命令名（与 shell 行为一致）。
 	if err := syscall.Exec(execPath, cmdline, env); err != nil {
 		return fmt.Errorf("exec %s: %w", execPath, err)
 	}
 	return nil // 不可达
+}
+
+// applyWorkdirAndUser 应用 --workdir 与 --user（经 LICORE_WORKDIR / LICORE_USER
+// 下发）。两者都为空时是 no-op（保持历史行为：root 身份、根目录）。
+//
+// 顺序：先 chdir 再 setgid/setuid。反过来的话，chdir 就要以目标用户身份
+// 执行，而用户可能对目标目录没有权限——Docker 也是先切目录再降权的。
+//
+// **失败必须报错，不许静默忽略**：静默忽略会让用户以为容器以 uid 1000 跑着，
+// 实际是 root——这正是"以为收紧了其实没有"的那类安全问题。
+func applyWorkdirAndUser() error {
+	env := os.Environ()
+
+	if wd := workdirFromEnv(env); wd != "" {
+		if err := os.Chdir(wd); err != nil {
+			return fmt.Errorf("切换工作目录到 %s 失败: %w", wd, err)
+		}
+	}
+
+	spec := userFromEnv(env)
+	if spec == "" {
+		return nil
+	}
+	uid, gid, err := ParseUserSpec(spec)
+	if err != nil {
+		return fmt.Errorf("解析 --user %q 失败: %w", spec, err)
+	}
+	// 先 gid 后 uid：setuid 之后就不再持有 CAP_SETGID，改不动组了。
+	if err := syscall.Setgroups([]int{gid}); err != nil {
+		// 非 root 起点时允许失败（此时本就无法改组），但继续尝试 setgid。
+		slog.Debug("设置附加组失败（忽略）", "gid", gid, "err", err)
+	}
+	if err := syscall.Setgid(gid); err != nil {
+		return fmt.Errorf("设置 gid=%d 失败: %w", gid, err)
+	}
+	if err := syscall.Setuid(uid); err != nil {
+		return fmt.Errorf("设置 uid=%d 失败: %w", uid, err)
+	}
+	slog.Debug("容器以指定用户启动", "uid", uid, "gid", gid)
+	return nil
 }
 
 // setupContainerDev 在 rootfs/dev 下装配容器所需的设备环境。

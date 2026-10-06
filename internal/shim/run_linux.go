@@ -95,6 +95,10 @@ func Run(ctx context.Context, o *Options) error {
 		// 两条路径各写各的才漏掉。**新增任何启动路径时，这份 env 必须与本
 		// 行保持一致**；TestStartEnvMatchesEngine 会守住这个不变量。
 		env = append(env, runtime.CapsEnv(cfg.CapDrop, cfg.CapAdd)...)
+		// --workdir / --user 同样经环境变量下发（runtime.Config 是冻结接口，
+		// 加不了字段）；init 在收口之后、execve 之前应用。
+		env = append(env, runtime.WorkdirEnv(cfg.WorkingDir)...)
+		env = append(env, runtime.UserEnv(cfg.User)...)
 		res, err := startWithFn(&runtime.Config{
 			Rootfs:   cfg.Rootfs,
 			Hostname: cfg.Hostname,

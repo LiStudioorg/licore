@@ -103,17 +103,30 @@ func runExec(cmd *cobra.Command, out io.Writer, opts *execArgs) error {
 			return fmt.Errorf("exec: 非法 --user %q", opts.User)
 		}
 	}
+	// 未显式指定时，继承**容器创建时**的 --user / --workdir。
+	//
+	// 否则 `run --user 1000 --workdir /srv` 起来的容器，exec 进去却是
+	// root + 根目录 —— 用户会误以为 exec 的 uid 就是服务的 uid，排查时被带偏。
+	// 与 --cap-drop 同一处理方式：先继承容器配置，再叠加本次显式指定。
+	execWorkdir := opts.Workdir
+	if execWorkdir == "" {
+		execWorkdir = cfg.WorkingDir
+	}
+	execUser := opts.User
+	if execUser == "" {
+		execUser = cfg.User
+	}
 	// 收口规格经环境变量下发给容器内的 helper：
 	// 默认继承**容器创建时**的 --cap-drop，再叠加本次 exec 的 --cap-drop。
 	// 这些 LICORE_* 变量会被 helper 在 execve 用户命令前剥掉，
 	// 因此不会泄漏进用户命令的环境。
-	env := append(runtime.ExecSetupEnv(cfg.CapDrop, opts.CapDrop), opts.Env...)
+	env := append(runtime.ExecSetupEnvUser(cfg.CapDrop, opts.CapDrop, execUser), opts.Env...)
 	code, err := runtime.Exec(&runtime.ExecOptions{
 		TargetPID: state.InitPID,
 		Cmd:       opts.Cmd,
 		Env:       env,
-		Workdir:   opts.Workdir,
-		User:      opts.User,
+		Workdir:   execWorkdir,
+		User:      execUser,
 		TTY:       opts.TTY,
 		// 把 exec 进程放进容器的 cgroup，否则它会落在本 CLI 进程所在的
 		// cgroup（实测 user.slice/...session-N.scope），**绕过 --memory /

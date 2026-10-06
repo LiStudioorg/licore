@@ -303,6 +303,10 @@ func runForeground(ctx context.Context, st *store.Store, cfg *store.ContainerCon
 	// 能力裁剪规格同样经环境变量下发：init 在 execve 前读取并应用。
 	// 空值表示走运行时内置的 Docker 默认集。
 	env = append(env, runtime.CapsEnv(cfg.CapDrop, cfg.CapAdd)...)
+	// --workdir / --user 同理：runtime.Config 是冻结接口，加不了字段，
+	// 经环境变量下发给 init。
+	env = append(env, runtime.WorkdirEnv(cfg.WorkingDir)...)
+	env = append(env, runtime.UserEnv(cfg.User)...)
 	r, err := runtime.StartWith(&runtime.Config{
 		Rootfs:   cfg.Rootfs,
 		Hostname: cfg.Hostname,
