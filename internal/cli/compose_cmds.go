@@ -116,14 +116,28 @@ func (cc *composeCmd) up(out io.Writer) *cobra.Command {
 				}
 			}
 			// 依服务声明顺序启动（depends_on 的依赖先由用户保证已 up）。
+			//
+			// 副本数取 `replicas`（缺省 1）——此前恒启一个，声明的 replicas 被
+			// 完全忽略。副本序号交给 serviceContainerName 生成名字，
+			// 与 scale / stopService 使用同一套规则。
 			for _, s := range services {
 				if len(want) > 0 && !want[s.Name] {
 					continue
 				}
-				if err := cc.startService(cmd, st, p, s, detach); err != nil {
-					return fmt.Errorf("compose up 服务 %s: %w", s.Name, err)
+				reps := s.Replicas
+				if reps <= 0 {
+					reps = 1
 				}
-				fmt.Fprintf(out, "服务 %s 已启动\n", s.Name)
+				for i := range reps {
+					if err := cc.startService(cmd, st, p, s, i, detach); err != nil {
+						return fmt.Errorf("compose up 服务 %s: %w", s.Name, err)
+					}
+				}
+				if reps > 1 {
+					fmt.Fprintf(out, "服务 %s 已启动（%d 个副本）\n", s.Name, reps)
+				} else {
+					fmt.Fprintf(out, "服务 %s 已启动\n", s.Name)
+				}
 			}
 			return nil
 		},
@@ -240,7 +254,9 @@ func (cc *composeCmd) scale(out io.Writer) *cobra.Command {
 				case n > cur:
 					diff := n - cur
 					for i := 0; i < diff; i++ {
-						if err := cc.startService(cmd, st, p, svc, true); err != nil {
+						// 新副本的序号是 cur+i：首副本无序号，其后 _1/_2…
+						// 序号传错会让所有副本撞同名，scale 直接失败。
+						if err := cc.startService(cmd, st, p, svc, cur+i, true); err != nil {
 							return fmt.Errorf("scale %s 增启: %w", svcName, err)
 						}
 						fmt.Fprintf(out, "服务 %s 副本 %d → %d\n", svcName, cur+i, cur+i+1)
@@ -319,8 +335,23 @@ func (cc *composeCmd) buildService(out io.Writer, cmd *cobra.Command, st *store.
 	return nil
 }
 
-// startService 用 engine.Run 创建并启动一个服务容器（容器名 <project>_<service>）。
-func (cc *composeCmd) startService(cmd *cobra.Command, st *store.Store, p *compose.Project, s *compose.ResolvedService, detach bool) error {
+// serviceContainerName 返回服务第 idx 个副本的容器名。
+// 命名规则（与 stopService / countService 共用，必须一致）：首副本无序号
+// （<project>_<service>），额外副本带序号（<project>_<service>_<idx>）。
+func (cc *composeCmd) serviceContainerName(p *compose.Project, service string, idx int) string {
+	base := cc.projectPrefix(p) + service
+	if idx == 0 {
+		return base
+	}
+	return fmt.Sprintf("%s_%d", base, idx)
+}
+
+// startService 用 engine.Run 创建并启动服务容器（容器名见 serviceContainerName）。
+//
+// idx 是副本序号：扩缩容时必须传入目标序号，否则每个副本都会落到同一个
+// `<project>_<service>` 上，第二次创建就因 "容器名已被占用" 失败——
+// `compose scale web=3` 于是永远只能有一个副本（真机实测）。
+func (cc *composeCmd) startService(cmd *cobra.Command, st *store.Store, p *compose.Project, s *compose.ResolvedService, idx int, detach bool) error {
 	imageRef := s.Image
 	if imageRef == "" {
 		return fmt.Errorf("服务 %s 无可用镜像（先 build）", s.Name)
@@ -335,7 +366,7 @@ func (cc *composeCmd) startService(cmd *cobra.Command, st *store.Store, p *compo
 	}
 	spec := &engine.RunSpec{
 		ImageRef:   imageRef,
-		Name:       cc.projectPrefix(p) + s.Name,
+		Name:       cc.serviceContainerName(p, s.Name, idx),
 		Hostname:   s.Hostname,
 		Cmd:        s.Command,
 		Entrypoint: s.Entrypoint,
@@ -376,13 +407,26 @@ func (cc *composeCmd) stopService(st *store.Store, p *compose.Project, service s
 }
 
 // countService 统计某服务当前运行的容器副本数。
+// countService 数出服务当前有多少个副本容器。
+//
+// 必须只认"首副本无序号、其余 _<数字>"这一种名字（与 serviceContainerName /
+// stopService 同一规则）。用 `prefix+"_"` 做前缀匹配会把**兄弟服务算进来**：
+// 服务 web 的前缀是 "<proj>_web_"，而服务 web_2 的容器叫 "<proj>_web_2"，
+// 于是 web 的副本数会被 web_2 的容器虚增，scale 的增/减方向随之判错。
 func (cc *composeCmd) countService(st *store.Store, p *compose.Project, service string) int {
-	prefix := cc.projectPrefix(p) + service
+	base := cc.projectPrefix(p) + service
 	containers, _ := st.ListContainers()
 	count := 0
 	for _, c := range containers {
-		if c.Name == prefix || strings.HasPrefix(c.Name, prefix+"_") {
+		if c.Name == base {
 			count++
+			continue
+		}
+		// 只接受 base_<数字>：下标必须整体是数字，"_web_2x" 这类不算同服务副本。
+		if rest, ok := strings.CutPrefix(c.Name, base+"_"); ok {
+			if _, err := strconv.Atoi(rest); err == nil {
+				count++
+			}
 		}
 	}
 	return count
