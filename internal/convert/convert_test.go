@@ -362,14 +362,31 @@ func TestTopLevelEntries(t *testing.T) {
 // -------- Docker 可用性检查 --------
 
 func TestCheckDockerMissing(t *testing.T) {
-	// 用一个必然不存在的 PATH 让 LookPath 失败。
+	// PATH 探测只对真实 CLI 实现生效，因此必须用 *CLIDocker；
+	// 用必然不存在的 PATH 让 LookPath 失败。
 	t.Setenv("PATH", "/nonexistent-path-for-test")
-	err := CheckDocker(context.Background(), &mockDocker{})
+	err := CheckDocker(context.Background(), &CLIDocker{})
 	if err == nil {
 		t.Fatal("docker 缺失应报错")
 	}
 	if !strings.Contains(err.Error(), "请先安装 docker") {
 		t.Errorf("错误应提示安装 docker: %v", err)
+	}
+}
+
+// TestCheckDockerInjectedSkipsPathProbe 回归：注入的自定义实现不因宿主 PATH
+// 里没有 docker 而被误报缺失。
+//
+// 历史缺陷：CheckDocker 无条件 exec.LookPath("docker")，于是所有传 mock 的
+// 调用（含 Convert 的 e2e 测试）在没装 docker 的机器上整体失败——而测试明明
+// 已经注入了可用的 Docker 实现。
+func TestCheckDockerInjectedSkipsPathProbe(t *testing.T) {
+	t.Setenv("PATH", "/nonexistent-path-for-test")
+	m := &mockDocker{responses: map[string]mockResponse{
+		"version": {out: []byte("29.8.1\n")},
+	}}
+	if err := CheckDocker(context.Background(), m); err != nil {
+		t.Fatalf("注入实现不应因宿主无 docker 而报错: %v", err)
 	}
 }
 

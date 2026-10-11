@@ -18,6 +18,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/LiStudioorg/licore/internal/network"
 	"github.com/LiStudioorg/licore/internal/store"
 )
 
@@ -84,6 +85,9 @@ func TestRunWritesContainerState(t *testing.T) {
 		return nil
 	}
 	t.Cleanup(func() { prepareAndStartFn = old })
+	// 本用例只关心状态落盘，与网络无关：挡掉真实网络接入，避免非 root /
+	// 无 nft 环境下被拖垮（网络本身由 network 包与 TestWireNetwork* 覆盖）。
+	stubNetwork(t)
 
 	res, err := Run(context.Background(), st, &RunSpec{
 		ImageRef: "demo:v1", Name: "web", Restart: store.RestartAlways,
@@ -113,6 +117,7 @@ func TestRunNameConflict(t *testing.T) {
 	old := prepareAndStartFn
 	prepareAndStartFn = func(context.Context, *store.Store, *store.ContainerConfig, *RunResult) error { return nil }
 	t.Cleanup(func() { prepareAndStartFn = old })
+	stubNetwork(t)
 
 	spec := &RunSpec{ImageRef: "demo:v1", Name: "web", Restart: store.RestartNo, Cmd: []string{"/x"}}
 	if _, err := Run(context.Background(), st, spec); err != nil {
@@ -121,6 +126,18 @@ func TestRunNameConflict(t *testing.T) {
 	if _, err := Run(context.Background(), st, spec); !errors.Is(err, store.ErrContainerExists) {
 		t.Fatalf("同名容器应报 ErrContainerExists，实得 %v", err)
 	}
+}
+
+// stubNetwork 把网络接入替换为 no-op，供"与网络无关"的 run 用例使用。
+// 真实网络接入需要 root + nft/iptables；这些用例不验证网络，
+// 不应因此依赖特权环境（也避免在有特权的机器上误建网桥/veth）。
+func stubNetwork(t *testing.T) {
+	t.Helper()
+	orig := wireNetworkFn
+	wireNetworkFn = func(*store.Store, *store.ContainerConfig, string, string, []*network.PortMapping) error {
+		return nil
+	}
+	t.Cleanup(func() { wireNetworkFn = orig })
 }
 
 // writeFakeImage 在 dir 里生成最小合法 .licore（单层 + config blob）并配

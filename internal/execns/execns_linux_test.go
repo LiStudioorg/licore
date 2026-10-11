@@ -310,12 +310,20 @@ func TestEnabledMatchesDiscovery(t *testing.T) {
 }
 
 // TestRealNsenterIfPresent 在真的装了 nsenter 的机器上做一次端到端冒烟：
-// 进入自己的命名空间执行 true（不需 root，因为是自己已有的 ns）。
+// 进入自己的命名空间执行 true。
+//
+// **需要 CAP_SYS_ADMIN**：setns 即便"进入自己已在的命名空间"也要该能力。
+// 非 root 下必然 EPERM，故直接按 euid 判定跳过，而不是去匹配 nsenter 的
+// 错误文本——那文本随 locale 变化（中文系统是"不允许的操作"，英文是
+// "Operation not permitted"），按文本匹配会让测试在中文环境下恒红。
 func TestRealNsenterIfPresent(t *testing.T) {
 	if findNsenterReal() == nil {
 		t.Skip("本机没有 nsenter，跳过真实调用冒烟")
 	}
-	// -t <自身 pid> 进入「自己已在的」命名空间，无需特权即可成功。
+	if os.Geteuid() != 0 {
+		t.Skip("非 root：setns 需要 CAP_SYS_ADMIN，跳过真实调用冒烟")
+	}
+	// -t <自身 pid> 进入「自己已在的」命名空间，root 下无需额外特权即可成功。
 	prog := findNsenterReal()
 	argv, err := buildNsenterArgv(prog, selfPID(), []string{"/bin/echo", "nsenter-smoke"})
 	if err != nil {
@@ -323,12 +331,6 @@ func TestRealNsenterIfPresent(t *testing.T) {
 	}
 	out, err := exec.Command(argv[0], argv[1:]...).CombinedOutput()
 	if err != nil {
-		// setns 连「进入自己所在命名空间」都需要 CAP_SYS_ADMIN。
-		// 非 root 环境下这是预期结果，跳过而不是判失败——否则这个测试
-		// 会在普通开发者机器上恒红，变成噪音。
-		if strings.Contains(string(out), "Operation not permitted") {
-			t.Skipf("非 root，setns 需要 CAP_SYS_ADMIN，跳过真实调用: %s", strings.TrimSpace(string(out)))
-		}
 		t.Fatalf("真实 nsenter 调用失败: %v\n%s", err, out)
 	}
 	if !strings.Contains(string(out), "nsenter-smoke") {

@@ -114,10 +114,18 @@ func (d *CLIDocker) RunToFile(ctx context.Context, path string, args ...string) 
 //   - 没装 docker          → 去装
 //   - 装了但 daemon 连不上  → 启动 daemon，或者（最常见）当前用户没权限访问
 //     /var/run/docker.sock，需要 sudo 或加入 docker 组
+//
+// **PATH 探测只对真实 CLI 实现（*CLIDocker）有意义**：调用方可注入自定义
+// Docker 实现（测试的 mock、未来的其它后端），此时宿主 PATH 里有没有 docker
+// 与它能否工作无关——拿宿主 PATH 去否定一个注入实现，会让所有注入路径在
+// 没装 docker 的机器上误报 ErrDockerMissing（真实缺陷：convert 的 e2e 测试
+// 正因此在本机无 docker 时整体失败）。因此仅当实现是 *CLIDocker 时才查 PATH。
 func CheckDocker(ctx context.Context, d Docker) error {
-	if _, err := exec.LookPath("docker"); err != nil {
-		return fmt.Errorf("%w：请先安装 docker（https://docs.docker.com/engine/install/）: %w",
-			ErrDockerMissing, err)
+	if _, ok := d.(*CLIDocker); ok {
+		if _, err := exec.LookPath("docker"); err != nil {
+			return fmt.Errorf("%w：请先安装 docker（https://docs.docker.com/engine/install/）: %w",
+				ErrDockerMissing, err)
+		}
 	}
 	out, err := d.Run(ctx, "version", "--format", "{{.Server.Version}}")
 	if err != nil {

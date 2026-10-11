@@ -4,6 +4,7 @@
 package engine
 
 import (
+	"os"
 	"testing"
 
 	"github.com/LiStudioorg/licore/internal/network"
@@ -73,7 +74,14 @@ func TestWireNetworkHostNone(t *testing.T) {
 
 // TestWireNetworkPresetEnsured 验证缺省 licore0 网络会自动补建（无 root 时
 // 网桥创建失败仅告警，不阻断端点登记与 IP 分配）。
+//
+// **需要 root + nft/iptables**：缺省 bridge 网络要真实建网桥并实化 NAT，
+// 而 ApplyNAT 失败对 bridge 容器是致命错误（不能只告警——那会产出"起来了
+// 但完全没网"的容器）。非 root 环境无法满足，直接跳过而非报错。
 func TestWireNetworkPresetEnsured(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("非 root：缺省 bridge 网络需建网桥并实化 NAT，跳过")
+	}
 	st := &store.Store{Root: t.TempDir()}
 	cfg := &store.ContainerConfig{
 		ConfigVersion: 1, ID: "abcdef123456", Name: "web", ImageRef: "x:v1",

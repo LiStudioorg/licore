@@ -172,7 +172,7 @@ func Run(ctx context.Context, st *store.Store, spec *RunSpec) (*RunResult, error
 	}
 	// 容器已登记：接入网络（alloc IP）、登记端口并实化 NAT。失败时回滚断开，
 	// 避免残留半接入的端点；veth 进容器 netns 由运行时装配，见 runForeground/shim。
-	if err := wireNetworkBeforeStart(st, cfg, spec.Network, spec.IP, ports); err != nil {
+	if err := wireNetworkFn(st, cfg, spec.Network, spec.IP, ports); err != nil {
 		disconnectContainer(st, cfg)
 		_ = st.RemoveContainer(cfg.ID)
 		return nil, err
@@ -224,6 +224,12 @@ func Run(ctx context.Context, st *store.Store, spec *RunSpec) (*RunResult, error
 
 // prepareAndStartFn 是启动注入点（测试替换为 fake，避开真实 namespace）。
 var prepareAndStartFn = prepareAndStart
+
+// wireNetworkFn 是网络接入注入点。默认走真实的 wireNetworkBeforeStart
+// （建网桥/veth、实化 NAT），需要 root。测试验证"状态落盘/名字冲突/卷接入"
+// 这类与网络无关的行为时替换为 no-op，从而不必要求特权，也不再因宿主缺
+// nft/iptables 而整体失败（真实缺陷：这两个用例曾被真实网络拖垮）。
+var wireNetworkFn = wireNetworkBeforeStart
 
 // prepareAndStart 做"解包+合并 rootfs → 启动"。失败由 Run 清理。
 func prepareAndStart(ctx context.Context, st *store.Store, cfg *store.ContainerConfig, res *RunResult) error {
