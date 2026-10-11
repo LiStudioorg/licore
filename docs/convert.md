@@ -45,11 +45,35 @@ licore convert --arch arm64 alpine:3.20 -o /tmp/alpine-arm64.licore
 licore convert alpine:3.20 --tag myorg/base:3.20 -o /tmp/base.licore
 ```
 
-导入后即可正常运行：
+### 交互式询问
 
-```bash
-licore run alpine:3.20 /bin/sh -c 'cat /etc/alpine-release'
+单个转换时，若**没有传相关 flag** 且 stdin 是**交互终端**，会先展示检测信息
+（源镜像 / 大小 / 支持的架构 / ENTRYPOINT），再逐项询问：
+
 ```
+源镜像 nginx:1.27-alpine
+大小 50.0 MiB
+架构 386 / amd64 / arm / arm64 / loong64 / riscv64
+ENTRYPOINT /docker-entrypoint.sh
+
+目标架构？[amd64]:
+是否精简（--slim，删 docs/man/apt cache）？[y/N]:
+是否立即导入本地（--import）？[Y/n]:
+
+转换 nginx:1.27-alpine → amd64，导入本地？
+[Y/n]:
+```
+
+规则：
+
+- **已传入的 flag 对应问题会跳过**（如 `--arch arm64` 就不再问架构）。
+- 每个问题直接回车取方括号内的**默认值**（默认架构是宿主架构、默认不精简、
+  默认导入本地）。
+- 选"不导入"才会追问输出路径；默认路径是 `<name>-<tag>-<arch>.licore`。
+- `--yes` / `-y`：**显式非交互**，全部取默认值，不提问，可直接完成一次转换。
+- **非终端输入**（管道 / 重定向）且没有 `--yes`：不提问，且**保持旧行为**——
+  既没 `-o` 也没 `--import` 时报错。这保证既有脚本行为不变。
+- 最终确认答 `n`（或空输入到 EOF）视为取消，退出码 0。
 
 ### 常用参数
 
@@ -58,10 +82,18 @@ licore run alpine:3.20 /bin/sh -c 'cat /etc/alpine-release'
 | `-o, --output PATH` | 输出 `.licore` 文件路径 |
 | `--import` | 转换后直接导入本地 store（不产出文件） |
 | `--arch ARCH` | 目标架构，默认宿主 `GOARCH` |
+| `--slim` | 构建精简镜像（**当前不生效**，与常规转换一致） |
+| `-y, --yes` | 非交互：所有询问项取默认值，不提问 |
 | `--tag NAME:VERSION` | 覆盖产物引用，默认由 Docker 镜像名派生 |
 | `--keep-docker-image` | 转换后**不**删除 docker 侧拉取的镜像 |
 | `--no-cleanup` | 保留临时容器与导出 tar（排查用） |
 | `--data-dir DIR` | 数据目录（默认 `$LICORE_HOME` 或 `~/.licore`） |
+
+导入后即可正常运行：
+
+```bash
+licore run alpine:3.20 /bin/sh -c 'cat /etc/alpine-release'
+```
 
 > 默认会在转换成功后 `docker rmi` 掉本次拉取的镜像。如果你原本就想保留它，
 > 加 `--keep-docker-image`；转换**失败**时不会删，便于排查。

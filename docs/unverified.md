@@ -334,3 +334,20 @@ exec 的 `-e/-w/-u/-i/-t/--cap-drop/--cap-add(拒绝)/cgroup 归置`、
 **仍未验证**：`--storage` 配额实际生效（需 XFS project quota）、
 `--network-bandwidth`/`--gpu`/`--npu`（功能未实现，CLI 显式拒绝）、
 cgroup v1 路径下的资源项、macOS/Android 平台项。
+
+## `licore convert` 交互式询问（未在真实 docker 上验证）
+
+新增 `licore convert` 无相关 flag 时的交互式询问（架构 / 精简 / 导入 / 输出路径）
+与 `--yes`/`-y`、`--slim`（no-op）flag。交互判定与参数回填由纯函数
+`planConvertQuestions` 覆盖（8 组条件组合单测），I/O 层由 `runConvertPrompt`
+单测覆盖；`isTTY` 改为分平台 ioctl（linux/android 用 `TCGETS`、darwin 用
+`TIOCGETA`），因为 `os.ModeCharDevice` 无法区分 `/dev/null` 与真终端
+（反向验证时实际踩到：`convert x </dev/null` 误入交互）。
+
+**验证方式**：本机无 docker（见《已知的"失败"》），故用**伪 docker**脚本
+（只实现 version/inspect/image/create/export/pull）在真 TTY（`script -qec`）
+下跑通全部 5 个场景：TTY 无 flag 弹问、TTY 部分 flag 只问剩余、TTY `--yes`/`-y`
+不弹、非 TTY 不弹且缺输出报错、全 flag 传齐不弹。
+
+**未验证**：与**真实 docker** 的端到端（真实 `docker export` 大镜像 + 交互）。
+首次在有 docker 的机器上使用时，建议先 `licore convert alpine:3.20` 交互跑一次。

@@ -4,6 +4,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -27,6 +28,8 @@ func newConvertCommand(out io.Writer) *cobra.Command {
 		output    string
 		importIt  bool
 		arch      string
+		slim      bool
+		assumeYes bool
 		noCleanup bool
 		keepImage bool
 		dataDir   string
@@ -45,6 +48,9 @@ func newConvertCommand(out io.Writer) *cobra.Command {
 			"单个转换：\n" +
 			"  licore convert alpine:3.20 -o alpine-3.20.licore\n" +
 			"  licore convert nginx:1.27-alpine --import\n\n" +
+			"无相关 flag 且 stdin 是终端时会逐项询问（架构 / 精简 / 是否导入 / 输出路径）；\n" +
+			"已传的 flag 对应问题会跳过。--yes/-y 取默认值不提问；管道 / 重定向等\n" +
+			"非终端输入不提问（缺 -o/--import 时仍报错，保持脚本兼容）。\n\n" +
 			"批量转换（images.txt 每行一个镜像，支持 # 注释）：\n" +
 			"  licore convert --from-file images.txt --output-dir ./dist/\n\n" +
 			"需要本机可用 docker 且当前用户有权访问 docker socket。",
@@ -74,14 +80,82 @@ func newConvertCommand(out io.Writer) *cobra.Command {
 			if len(args) == 0 {
 				return fmt.Errorf("convert: 必须指定 docker 镜像名，或用 --from-file 批量转换")
 			}
-			if output == "" && !importIt {
-				return fmt.Errorf("convert: 请用 -o/--output 指定输出文件，或用 --import 直接导入本地")
-			}
-			if output != "" && importIt {
-				return fmt.Errorf("convert: -o/--output 与 --import 不能同时使用（--import 不产出文件）")
-			}
 			if outputDir != "" {
 				return fmt.Errorf("convert: --output-dir 只用于批量模式（配合 --from-file）")
+			}
+
+			// 交互式询问：仅单个镜像时按 TTY / --yes 决定交互方式（见 planConvertQuestions）。
+			// 已显式传入的 flag 对应问题会跳过；--yes 用默认值；纯非 TTY（脚本）
+			// 保持旧行为（缺输出方式报错），不会让旧脚本静默写入 store。
+			plan := planConvertQuestions(convertPromptInput{
+				tty:           isTTY(os.Stdin),
+				assumeYes:     assumeYes,
+				archChanged:   cmd.Flags().Changed("arch"),
+				slimChanged:   cmd.Flags().Changed("slim"),
+				importChanged: cmd.Flags().Changed("import"),
+				outputChanged: cmd.Flags().Changed("output"),
+			})
+			if plan.Interactive {
+				hint := convertHintFromDocker(cmd, args[0])
+				// 默认值需合并已传的 flag：跳过的架构问题不会写回，若不给默认值，
+				// 确认行会显示宿主架构而非 --arch 的值（实测显示与结果不一致）。
+				base := defaultConvertChoices(hint)
+				if arch != "" {
+					base.Arch = arch
+				}
+				if slim {
+					base.Slim = true
+				}
+				if importIt {
+					base.Import = true
+				}
+				if output != "" {
+					base.Import = false
+					base.OutPath = output
+				}
+				choices, err := runConvertPrompt(cmd, out, plan, hint, base)
+				if err != nil {
+					if errors.Is(err, errPromptCancelled) {
+						fmt.Fprintln(out, "已取消。")
+						return nil
+					}
+					return err
+				}
+				// 用户显式输入的答案回填到对应变量（未问到的保持原 flag 值）。
+				for _, q := range plan.Questions {
+					switch q {
+					case qArch:
+						arch = choices.Arch
+					case qSlim:
+						slim = choices.Slim
+					case qImport:
+						if choices.Import {
+							importIt = true
+						} else {
+							output = choices.OutPath
+						}
+					}
+				}
+			} else if plan.ApplyDefaults {
+				// --yes：未被 flag 指定的选项取默认值（默认导入本地）。
+				base := defaultConvertChoices(convertHint{Image: args[0]})
+				if !cmd.Flags().Changed("arch") {
+					arch = base.Arch
+				}
+				if !cmd.Flags().Changed("slim") {
+					slim = base.Slim // false
+				}
+				if !cmd.Flags().Changed("import") && !cmd.Flags().Changed("output") {
+					importIt = base.Import // true
+				}
+			} else if output == "" && !importIt {
+				// 纯非 TTY（脚本/管道）：与旧行为一致，必须显式给出输出方式。
+				return fmt.Errorf("convert: 请用 -o/--output 指定输出文件，或用 --import 直接导入本地" +
+					"（交互式终端下可省略，直接回车走默认；非交互请加 --yes）")
+			}
+
+			if output != "" && importIt {
+				return fmt.Errorf("convert: -o/--output 与 --import 不能同时使用（--import 不产出文件）")
 			}
 			if arch != "" && !image.ValidArch(arch) {
 				return fmt.Errorf("convert: --arch %q 不受支持，可选值：%s",
@@ -94,6 +168,12 @@ func newConvertCommand(out io.Writer) *cobra.Command {
 				if name == "" || version == "" {
 					return fmt.Errorf("convert: --tag 需要 NAME:VERSION 形式，得到 %q", tag)
 				}
+			}
+
+			// --slim 目前是明确的 no-op（与 build 的 --slim 一致，见 docs/audit-v0.5.0.md）。
+			// 诚实告知用户"当前不生效"，避免以为已精简。
+			if slim {
+				fmt.Fprintln(out, "提示：--slim 当前不生效（转换产物与常规转换一致），已接受该参数。")
 			}
 
 			res, err := convert.Convert(cmd.Context(), &convert.Options{
@@ -140,6 +220,8 @@ func newConvertCommand(out io.Writer) *cobra.Command {
 	cmd.Flags().StringVarP(&output, "output", "o", "", "输出 .licore 文件路径")
 	cmd.Flags().BoolVar(&importIt, "import", false, "转换后直接导入本地（不输出文件）")
 	cmd.Flags().StringVar(&arch, "arch", "", "目标架构（默认宿主 GOARCH）")
+	cmd.Flags().BoolVar(&slim, "slim", false, "构建精简镜像（当前不生效，与常规转换一致）")
+	cmd.Flags().BoolVarP(&assumeYes, "yes", "y", false, "非交互：所有询问项取默认值，不提问")
 	cmd.Flags().BoolVar(&noCleanup, "no-cleanup", false, "保留临时容器与导出 tar（调试用）")
 	cmd.Flags().BoolVar(&keepImage, "keep-docker-image", false, "转换后不删除 docker 镜像")
 	cmd.Flags().StringVar(&dataDir, "data-dir", "", "数据目录（默认 $LICORE_HOME 或 ~/.licore）")
